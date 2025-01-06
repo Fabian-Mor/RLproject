@@ -174,8 +174,12 @@ class SACAgent:
                 next_actions, next_log_probs = self.policy.get_action(next_obs)
 
                 # Get Q-values for next states from both target networks
-                q1_next = self.q1.Q_value(next_obs, next_actions)
-                q2_next = self.q2.Q_value(next_obs, next_actions)
+                q1_all = self.q1.Q_value(torch.concat([observations, next_obs]),
+                                                torch.concat([actions, next_actions]))
+                q2_all = self.q2.Q_value(torch.concat([observations, next_obs]),
+                                                torch.concat([actions, next_actions]))
+                q1, q1_next = torch.chunk(q1_all, 2)
+                q2, q2_next = torch.chunk(q2_all, 2)
 
                 # Take minimum Q-value for robustness
                 min_q_next = torch.min(q1_next, q2_next)
@@ -191,14 +195,18 @@ class SACAgent:
 
             # Update Q-functions
             # First Q-function
-            current_q1 = self.q1.Q_value(observations, actions)
+            q1_all = self.q1.Q_value(torch.concat([observations, next_obs]),
+                                     torch.concat([actions, next_actions]))
+            current_q1, _ = torch.chunk(q1_all, 2)
             q1_loss = self.q1.loss(current_q1, q_target.detach())
             self.q1.optimizer.zero_grad()
             q1_loss.backward()
             self.q1.optimizer.step()
 
             # Second Q-function
-            current_q2 = self.q2.Q_value(observations, actions)
+            q2_all = self.q2.Q_value(torch.concat([observations, next_obs]),
+                                     torch.concat([actions, next_actions]))
+            current_q2, _ = torch.chunk(q2_all, 2)
             q2_loss = self.q2.loss(current_q2, q_target.detach())
             self.q2.optimizer.zero_grad()
             q2_loss.backward()
@@ -209,8 +217,12 @@ class SACAgent:
             new_actions, log_probs = self.policy.get_action(observations)
 
             # Calculate Q-values for new actions
-            q1_new = self.q1.Q_value(observations, new_actions)
-            q2_new = self.q2.Q_value(observations, new_actions)
+            q1_all = self.q1.Q_value(torch.concat([observations, next_obs]),
+                                     torch.concat([actions, next_actions]))
+            _, q1_new = torch.chunk(q1_all, 2)
+            q2_all = self.q2.Q_value(torch.concat([observations, next_obs]),
+                                     torch.concat([actions, next_actions]))
+            _, q2_new = torch.chunk(q2_all, 2)
             min_q_new = torch.min(q1_new, q2_new)
 
             # Calculate policy loss (negative for gradient ascent)
@@ -227,9 +239,7 @@ class SACAgent:
         return losses
 
     def _soft_update(self, source, target):
-        tau = self._config["tau"]
-        for source_param, target_param in zip(source.parameters(), target.parameters()):
-            target_param.data.copy_(tau * source_param.data + (1.0 - tau) * target_param.data)
+        pass
 
     def reset(self):
         pass
