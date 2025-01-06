@@ -1,171 +1,393 @@
 import torch
+import torch.nn as nn
 import numpy as np
-from torch.distributions import MultivariateNormal
-from torch import nn
 import gymnasium as gym
 from gymnasium import spaces
 import optparse
 import pickle
 
-class QFunction(nn.Module):
-    def __init__(self, input_size, action_dim, hidden_sizes, learning_rate=3e-4):
-        super().__init__()
-        layers = []
-        last_size = input_size + action_dim
-        for size in hidden_sizes:
-            layers.append(nn.Linear(last_size, size))
-            layers.append(nn.ReLU())
-            last_size = size
-        layers.append(nn.Linear(last_size, 1))
-        self.network = nn.Sequential(*layers)
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate)
+import memory as mem
+from feedforward import Feedforward
 
-    def forward(self, obs, action):
-        return self.network(torch.cat([obs, action], dim=-1))
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+torch.set_num_threads(1)
 
-    def fit(self, obs, action, target):
-        q_value = self.forward(obs, action)
-        loss = nn.MSELoss()(q_value, target)
+class UnsupportedSpace(Exception):
+    """Exception raised when the Sensor or Action space are not compatible."""
+    def __init__(self, message="Unsupported Space"):
+        self.message = message
+        super().__init__(self.message)
+
+class QFunction(Feedforward):
+    def __init__(self, observation_dim, action_dim, hidden_sizes=[100,100],
+                 learning_rate = 0.0002):
+        super().__init__(input_size=observation_dim + action_dim, hidden_sizes=hidden_sizes,
+                         output_size=1)
+        self.optimizer=torch.optim.Adam(self.parameters(),
+                                        lr=learning_rate,
+                                        eps=0.000001)
+        self.loss = torch.nn.SmoothL1Loss()
+
+    def fit(self, observations, actions, targets): # all arguments should be torch tensors
+        self.train() # put model in training mode
         self.optimizer.zero_grad()
+        # Forward pass
+
+        pred = self.Q_value(observations,actions)
+        # Compute Loss
+        loss = self.loss(pred, targets)
+
+        # Backward pass
         loss.backward()
         self.optimizer.step()
         return loss.item()
 
+    def Q_value(self, observations, actions):
+        return self.forward(torch.hstack([observations,actions]))
 
-class StochasticPolicy(nn.Module):
-    def __init__(self, input_size, hidden_sizes, action_dim, learning_rate=3e-4):
-        super().__init__()
-        layers = []
-        last_size = input_size
-        for size in hidden_sizes:
-            layers.append(nn.Linear(last_size, size))
-            layers.append(nn.ReLU())
-            last_size = size
-        layers.append(nn.Linear(last_size, action_dim * 2))  # Mean and log_std
-        self.network = nn.Sequential(*layers)
+class Policy(Feedforward):
+    def __init__(self, observation_dim, action_dim, hidden_sizes=[100, 100], learning_rate=0.0003):
+        super().__init__(input_size=observation_dim, hidden_sizes=hidden_sizes, output_size=action_dim)
         self.optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate)
+        self.log_std_min = -20
+        self.log_std_max = 2
 
-    def forward(self, obs):
-        x = self.network(obs)
-        mean, log_std = torch.chunk(x, 2, dim=-1)
-        log_std = torch.clamp(log_std, -20, 2)  # Clamp for numerical stability
+    def get_action(self, observation):
+        mean, log_std = self.forward(observation).chunk(2, dim=-1)
+        log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
         std = torch.exp(log_std)
-        return mean, std
+        dist = torch.distributions.Normal(mean, std)
+        x = dist.rsample()
+        action = torch.tanh(x)
 
-    def sample(self, obs):
-        mean, std = self.forward(obs)
-        dist = MultivariateNormal(mean, torch.diag_embed(std))
-        action = dist.rsample()  # Reparameterization trick
-        log_prob = dist.log_prob(action)
+        # Account for tanh squashing in log prob
+        log_prob = dist.log_prob(x)
+        log_prob -= torch.log(1 - action.pow(2) + 1e-6)
+        log_prob = log_prob.sum(-1, keepdim=True)
+
         return action, log_prob
 
+    def fit(self, observations, log_probs, q_values):
+        self.train()
+        self.optimizer.zero_grad()
+        policy_loss = (log_probs - q_values).mean()
+        policy_loss.backward()
+        self.optimizer.step()
+        return policy_loss.item()
 
 class SACAgent:
-    def __init__(self, obs_dim, action_dim, hidden_sizes_actor, hidden_sizes_critic,
-                 learning_rate_actor=3e-4, learning_rate_critic=3e-4, alpha=0.2, discount=0.99):
-        self.obs_dim = obs_dim
-        self.action_dim = action_dim
-        self.discount = discount
-        self.alpha = alpha
+    def __init__(self, observation_space, action_space, **userconfig):
+        if not isinstance(observation_space, spaces.Box):
+            raise UnsupportedSpace(f'Observation space {observation_space} incompatible (Require: Box)')
+        if not isinstance(action_space, spaces.Box):
+            raise UnsupportedSpace(f'Action space {action_space} incompatible (Require: Box)')
 
-        # Policy network
-        self.policy = StochasticPolicy(obs_dim, hidden_sizes_actor, action_dim, learning_rate_actor)
+        self._observation_space = observation_space
+        self._obs_dim = observation_space.shape[0]
+        self._action_space = action_space
+        self._action_dim = action_space.shape[0]
+        self._config = {
+            "discount": 0.95,
+            "tau": 0.005,
+            "learning_rate_actor": 0.00001,
+            "learning_rate_critic": 0.0001,
+            "hidden_sizes_actor": [128, 128],
+            "hidden_sizes_critic": [128, 128, 64],
+            "entropy_coeff": 0.2,
+            "batch_size": 256,
+            "buffer_size": int(1e6),
+        }
+        self._config.update(userconfig)
 
-        # Q-functions
-        self.Q1 = QFunction(obs_dim, action_dim, hidden_sizes_critic, learning_rate_critic)
-        self.Q2 = QFunction(obs_dim, action_dim, hidden_sizes_critic, learning_rate_critic)
-        self.Q1_target = QFunction(obs_dim, action_dim, hidden_sizes_critic, learning_rate_critic)
-        self.Q2_target = QFunction(obs_dim, action_dim, hidden_sizes_critic, learning_rate_critic)
+        # Replay buffer
+        self.buffer = mem.Memory(max_size=self._config["buffer_size"])
 
-        # Copy weights to target networks
+        # Networks
+        self.policy = Policy(observation_dim=self._obs_dim, action_dim=2 * self._action_dim,
+                             hidden_sizes=self._config["hidden_sizes_actor"], learning_rate=self._config["learning_rate_actor"])
+        self.q1 = QFunction(self._obs_dim, self._action_dim, self._config["hidden_sizes_critic"],
+                            self._config["learning_rate_critic"])
+        self.q2 = QFunction(self._obs_dim, self._action_dim, self._config["hidden_sizes_critic"],
+                            self._config["learning_rate_critic"])
+        self.q1_target = QFunction(self._obs_dim, self._action_dim, self._config["hidden_sizes_critic"], learning_rate=0)
+        self.q2_target = QFunction(self._obs_dim, self._action_dim, self._config["hidden_sizes_critic"], learning_rate=0)
+        print(self.q1)
+        print(self.q2)
+        print(self.q1_target)
+        print(self.q2_target)
+        print(self.policy)
+        self.target_entropy = -np.prod(action_space.shape)
+        self.log_alpha = torch.zeros(1, requires_grad=True)
+        self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=3e-4)
         self._copy_nets()
-
-        # Entropy adjustment (optional)
-        self.target_entropy = -float(action_dim)
-        self.log_alpha = torch.tensor([np.log(alpha)], requires_grad=True)
-        self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=learning_rate_actor)
 
     def _copy_nets(self):
-        self.Q1_target.load_state_dict(self.Q1.state_dict())
-        self.Q2_target.load_state_dict(self.Q2.state_dict())
+        self.q1_target.load_state_dict(self.q1.state_dict())
+        self.q2_target.load_state_dict(self.q2.state_dict())
 
-    def train(self, buffer, batch_size=256, iter_fit=32):
+    def act(self, observation):
+        with torch.no_grad():
+            observation = torch.tensor(observation, dtype=torch.float32).unsqueeze(0)
+            action, _ = self.policy.get_action(observation)
+        action = action.squeeze(0).numpy()
+        action = self._action_space.low + (action + 1.0) / 2.0 * (self._action_space.high - self._action_space.low)
+        return action
+
+    def store_transition(self, transition):
+        self.buffer.add_transition(transition)
+
+    def state(self):
+        return {
+            "policy": self.policy.state_dict(),
+            "q1": self.q1.state_dict(),
+            "q2": self.q2.state_dict(),
+            "q1_target": self.q1_target.state_dict(),
+            "q2_target": self.q2_target.state_dict()
+        }
+
+    def restore_state(self, state):
+        self.policy.load_state_dict(state["policy"])
+        self.q1.load_state_dict(state["q1"])
+        self.q2.load_state_dict(state["q2"])
+        self.q1_target.load_state_dict(state["q1_target"])
+        self.q2_target.load_state_dict(state["q2_target"])
+        self._copy_nets()  # Ensure target networks are properly synchronized
+
+    def reset(self):
+        pass  # SAC does not use action noise; no reset needed
+
+    def train(self, iter_fit=256):
         losses = []
         for _ in range(iter_fit):
-            data = buffer.sample(batch_size)
-            obs, actions, rewards, next_obs, dones = data
+            # Sample batch from replay buffer
+            batch = self.buffer.sample(self._config["batch_size"])
+            observations, actions, rewards, next_obs, dones = map(
+                lambda x: torch.tensor(np.array(x), dtype=torch.float32), zip(*batch)
+            )
 
-            obs = torch.tensor(obs, dtype=torch.float32)
-            actions = torch.tensor(actions, dtype=torch.float32)
-            rewards = torch.tensor(rewards, dtype=torch.float32).unsqueeze(-1)
-            next_obs = torch.tensor(next_obs, dtype=torch.float32)
-            dones = torch.tensor(dones, dtype=torch.float32).unsqueeze(-1)
-
-            # Critic Loss
+            # Calculate Q-targets
             with torch.no_grad():
-                next_action, next_log_prob = self.policy.sample(next_obs)
-                target_q1 = self.Q1_target(next_obs, next_action)
-                target_q2 = self.Q2_target(next_obs, next_action)
-                target_q = torch.min(target_q1, target_q2) - self.alpha * next_log_prob.unsqueeze(-1)
-                td_target = rewards + self.discount * (1.0 - dones) * target_q
+                # Get next actions and their log probs from current policy
+                next_actions, next_log_probs = self.policy.get_action(next_obs)
 
-            q1_loss = self.Q1.fit(obs, actions, td_target)
-            q2_loss = self.Q2.fit(obs, actions, td_target)
+                # Get Q-values for next states from both target networks
+                q1_next = self.q1_target.Q_value(next_obs, next_actions)
+                q2_next = self.q2_target.Q_value(next_obs, next_actions)
 
-            # Actor Loss
-            new_action, log_prob = self.policy.sample(obs)
-            q1_value = self.Q1(obs, new_action)
-            q2_value = self.Q2(obs, new_action)
-            actor_loss = (self.alpha * log_prob - torch.min(q1_value, q2_value)).mean()
+                # Take minimum Q-value for robustness
+                min_q_next = torch.min(q1_next, q2_next)
 
+                # Calculate entropy term
+                alpha = self._config["entropy_coeff"]
+                entropy_term = alpha * next_log_probs
+
+                # Compute targets for Q-functions
+                q_target = rewards.unsqueeze(-1) + \
+                           self._config["discount"] * (1 - dones.unsqueeze(-1)) * \
+                           (min_q_next - entropy_term)
+
+            # Update Q-functions
+            # First Q-function
+            current_q1 = self.q1.Q_value(observations, actions)
+            q1_loss = self.q1.loss(current_q1, q_target.detach())
+            self.q1.optimizer.zero_grad()
+            q1_loss.backward()
+            self.q1.optimizer.step()
+
+            # Second Q-function
+            current_q2 = self.q2.Q_value(observations, actions)
+            q2_loss = self.q2.loss(current_q2, q_target.detach())
+            self.q2.optimizer.zero_grad()
+            q2_loss.backward()
+            self.q2.optimizer.step()
+
+            # Update policy
+            # Get actions and log probs from current policy
+            new_actions, log_probs = self.policy.get_action(observations)
+
+            # Calculate Q-values for new actions
+            q1_new = self.q1.Q_value(observations, new_actions)
+            q2_new = self.q2.Q_value(observations, new_actions)
+            min_q_new = torch.min(q1_new, q2_new)
+
+            # Calculate policy loss (negative for gradient ascent)
+            policy_loss = (alpha * log_probs - min_q_new).mean()
+
+            # Update policy
             self.policy.optimizer.zero_grad()
-            actor_loss.backward()
+            policy_loss.backward()
             self.policy.optimizer.step()
 
-            # Entropy Adjustment
-            alpha_loss = -(self.log_alpha * (log_prob + self.target_entropy).detach()).mean()
-            self.alpha_optimizer.zero_grad()
-            alpha_loss.backward()
-            self.alpha_optimizer.step()
+            # Soft update target networks
+            self._soft_update(self.q1, self.q1_target)
+            self._soft_update(self.q2, self.q2_target)
 
-            self.alpha = self.log_alpha.exp().item()
+            # Store losses for logging
+            losses.append((q1_loss.item(), q2_loss.item(), policy_loss.item()))
 
-            losses.append((q1_loss, q2_loss, actor_loss.item(), alpha_loss.item()))
-
-        # Update target networks
-        self._copy_nets()
         return losses
 
+    def _soft_update(self, source, target):
+        tau = self._config["tau"]
+        for source_param, target_param in zip(source.parameters(), target.parameters()):
+            target_param.data.copy_(tau * source_param.data + (1.0 - tau) * target_param.data)
 
-class ReplayBuffer:
-    def __init__(self, max_size, obs_dim, action_dim):
-        self.max_size = max_size
-        self.ptr = 0
-        self.size = 0
-        self.obs = np.zeros((max_size, obs_dim), dtype=np.float32)
-        self.actions = np.zeros((max_size, action_dim), dtype=np.float32)
-        self.rewards = np.zeros(max_size, dtype=np.float32)
-        self.next_obs = np.zeros((max_size, obs_dim), dtype=np.float32)
-        self.dones = np.zeros(max_size, dtype=np.float32)
+    def reset(self):
+        pass
 
-    def store(self, obs, action, reward, next_obs, done):
-        self.obs[self.ptr] = obs
-        self.actions[self.ptr] = action
-        self.rewards[self.ptr] = reward
-        self.next_obs[self.ptr] = next_obs
-        self.dones[self.ptr] = done
-        self.ptr = (self.ptr + 1) % self.max_size
-        self.size = min(self.size + 1, self.max_size)
 
-    def sample(self, batch_size):
-        idxs = np.random.choice(self.size, batch_size, replace=False)
-        return (
-            self.obs[idxs],
-            self.actions[idxs],
-            self.rewards[idxs],
-            self.next_obs[idxs],
-            self.dones[idxs]
+class OUNoise():
+    def __init__(self, shape, theta: float = 0.15, dt: float = 1e-2):
+        self._shape = shape
+        self._theta = theta
+        self._dt = dt
+        self.noise_prev = np.zeros(self._shape)
+        self.reset()
+
+    def __call__(self) -> np.ndarray:
+        noise = (
+            self.noise_prev
+            + self._theta * ( - self.noise_prev) * self._dt
+            + np.sqrt(self._dt) * np.random.normal(size=self._shape)
         )
+        self.noise_prev = noise
+        return noise
+
+    def reset(self) -> None:
+        self.noise_prev = np.zeros(self._shape)
+
+
+class DDPGAgent(object):
+    """
+    Agent implementing Q-learning with NN function approximation.
+    """
+    def __init__(self, observation_space, action_space, **userconfig):
+
+        if not isinstance(observation_space, spaces.box.Box):
+            raise UnsupportedSpace('Observation space {} incompatible ' \
+                                   'with {}. (Require: Box)'.format(observation_space, self))
+        if not isinstance(action_space, spaces.box.Box):
+            raise UnsupportedSpace('Action space {} incompatible with {}.' \
+                                   ' (Require Box)'.format(action_space, self))
+
+        self._observation_space = observation_space
+        self._obs_dim=self._observation_space.shape[0]
+        self._action_space = action_space
+        self._action_n = action_space.shape[0]
+        self._config = {
+            "eps": 0.1,            # Epsilon: noise strength to add to policy
+            "discount": 0.95,
+            "buffer_size": int(1e6),
+            "batch_size": 128,
+            "learning_rate_actor": 0.00001,
+            "learning_rate_critic": 0.0001,
+            "hidden_sizes_actor": [128,128],
+            "hidden_sizes_critic": [128,128,64],
+            "update_target_every": 100,
+            "use_target_net": True
+        }
+        self._config.update(userconfig)
+        self._eps = self._config['eps']
+
+        self.action_noise = OUNoise((self._action_n))
+
+        self.buffer = mem.Memory(max_size=self._config["buffer_size"])
+
+        # Q Network
+        self.Q = QFunction(observation_dim=self._obs_dim,
+                           action_dim=self._action_n,
+                           hidden_sizes= self._config["hidden_sizes_critic"],
+                           learning_rate = self._config["learning_rate_critic"])
+        # target Q Network
+        self.Q_target = QFunction(observation_dim=self._obs_dim,
+                                  action_dim=self._action_n,
+                                  hidden_sizes= self._config["hidden_sizes_critic"],
+                                  learning_rate = 0)
+
+        self.policy = Feedforward(input_size=self._obs_dim,
+                                  hidden_sizes= self._config["hidden_sizes_actor"],
+                                  output_size=self._action_n,
+                                  activation_fun = torch.nn.ReLU(),
+                                  output_activation = torch.nn.Tanh())
+        self.policy_target = Feedforward(input_size=self._obs_dim,
+                                         hidden_sizes= self._config["hidden_sizes_actor"],
+                                         output_size=self._action_n,
+                                         activation_fun = torch.nn.ReLU(),
+                                         output_activation = torch.nn.Tanh())
+        print(self.Q)
+        print(self.Q_target)
+        print(self.policy)
+        print(self.policy_target)
+        self._copy_nets()
+
+        self.optimizer=torch.optim.Adam(self.policy.parameters(),
+                                        lr=self._config["learning_rate_actor"],
+                                        eps=0.000001)
+        self.train_iter = 0
+
+    def _copy_nets(self):
+        self.Q_target.load_state_dict(self.Q.state_dict())
+        self.policy_target.load_state_dict(self.policy.state_dict())
+
+    def act(self, observation, eps=None):
+        if eps is None:
+            eps = self._eps
+        #
+        action = self.policy.predict(observation) + eps*self.action_noise()  # action in -1 to 1 (+ noise)
+        action = self._action_space.low + (action + 1.0) / 2.0 * (self._action_space.high - self._action_space.low)
+        return action
+
+    def store_transition(self, transition):
+        self.buffer.add_transition(transition)
+
+    def state(self):
+        return (self.Q.state_dict(), self.policy.state_dict())
+
+    def restore_state(self, state):
+        self.Q.load_state_dict(state[0])
+        self.policy.load_state_dict(state[1])
+        self._copy_nets()
+
+    def reset(self):
+        self.action_noise.reset()
+
+    def train(self, iter_fit=32):
+        to_torch = lambda x: torch.from_numpy(x.astype(np.float32))
+        losses = []
+        self.train_iter+=1
+        if self._config["use_target_net"] and self.train_iter % self._config["update_target_every"] == 0:
+            self._copy_nets()
+        for i in range(iter_fit):
+
+            # sample from the replay buffer
+            data=self.buffer.sample(batch=self._config['batch_size'])
+            s = to_torch(np.stack(data[:,0])) # s_t
+            a = to_torch(np.stack(data[:,1])) # a_t
+            rew = to_torch(np.stack(data[:,2])[:,None]) # rew  (batchsize,1)
+            s_prime = to_torch(np.stack(data[:,3])) # s_t+1
+            done = to_torch(np.stack(data[:,4])[:,None]) # done signal  (batchsize,1)
+
+            if self._config["use_target_net"]:
+                q_prime = self.Q_target.Q_value(s_prime, self.policy_target.forward(s_prime))
+            else:
+                q_prime = self.Q.Q_value(s_prime, self.policy.forward(s_prime))
+            # target
+            gamma=self._config['discount']
+            td_target = rew + gamma * (1.0-done) * q_prime
+
+            # optimize the Q objective
+            fit_loss = self.Q.fit(s, a, td_target)
+
+            # optimize actor objective
+            self.optimizer.zero_grad()
+            q = self.Q.Q_value(s, self.policy.forward(s))
+            actor_loss = -torch.mean(q)
+            actor_loss.backward()
+            self.optimizer.step()
+
+            losses.append((fit_loss, actor_loss.item()))
+
+        return losses
 
 
 def main():
@@ -173,96 +395,99 @@ def main():
     optParser.add_option('-e', '--env', action='store', type='string',
                          dest='env_name', default="Pendulum-v1",
                          help='Environment (default %default)')
+    optParser.add_option('-a', '--agent', action='store', type='string',
+                         dest='agent', default="DDPG",
+                         help='Agent type (DDPG or SAC, default %default)')
+    optParser.add_option('-n', '--eps', action='store', type='float',
+                         dest='eps', default=0.1,
+                         help='Policy noise (default %default)')
     optParser.add_option('-t', '--train', action='store', type='int',
                          dest='train', default=32,
-                         help='number of training batches per episode (default %default)')
+                         help='Number of training batches per episode (default %default)')
     optParser.add_option('-l', '--lr', action='store', type='float',
-                         dest='lr', default=0.0003,
-                         help='learning rate for policy and Q-networks (default %default)')
+                         dest='lr', default=0.0001,
+                         help='Learning rate for actor/policy (default %default)')
     optParser.add_option('-m', '--maxepisodes', action='store', type='float',
                          dest='max_episodes', default=2000,
-                         help='number of episodes (default %default)')
+                         help='Number of episodes (default %default)')
+    optParser.add_option('-u', '--update', action='store', type='float',
+                         dest='update_every', default=100,
+                         help='Number of episodes between target network updates (default %default)')
     optParser.add_option('-s', '--seed', action='store', type='int',
                          dest='seed', default=None,
-                         help='random seed (default %default)')
+                         help='Random seed (default %default)')
     opts, args = optParser.parse_args()
 
+    # Set environment
     env_name = opts.env_name
     env = gym.make(env_name)
     render = False
     max_episodes = opts.max_episodes
     max_timesteps = 2000
     train_iter = opts.train
+    eps = opts.eps
     lr = opts.lr
     random_seed = opts.seed
-    hidden_sizes_actor = [256, 256]
-    hidden_sizes_critic = [256, 256]
-    alpha = 0.2
-    discount = 0.99
 
     if random_seed is not None:
         torch.manual_seed(random_seed)
         np.random.seed(random_seed)
 
-    agent = SACAgent(
-        obs_dim=env.observation_space.shape[0],
-        action_dim=env.action_space.shape[0],
-        hidden_sizes_actor=hidden_sizes_actor,
-        hidden_sizes_critic=hidden_sizes_critic,
-        learning_rate_actor=lr,
-        learning_rate_critic=lr,
-        alpha=alpha,
-        discount=discount
-    )
+    # Initialize agent
+    if opts.agent == "DDPG":
+        agent = DDPGAgent(env.observation_space, env.action_space,
+                          eps=eps, learning_rate_actor=lr,
+                          update_target_every=opts.update_every)
+    elif opts.agent == "SAC":
+        agent = SACAgent(env.observation_space, env.action_space,
+                         learning_rate_actor=lr)
+    else:
+        raise ValueError(f"Unsupported agent type: {opts.agent}")
 
-    replay_buffer = ReplayBuffer(max_size=1000000, obs_dim=env.observation_space.shape[0],
-                                 action_dim=env.action_space.shape[0])
-
+    # Logging variables
     rewards = []
     lengths = []
     losses = []
+    timestep = 0
 
+    def save_statistics():
+        with open(f"./results/{opts.agent}_{env_name}-eps{eps}-t{train_iter}-l{lr}-s{random_seed}-stat.pkl", 'wb') as f:
+            pickle.dump({"rewards": rewards, "lengths": lengths, "eps": eps, "train": train_iter,
+                         "lr": lr, "update_every": opts.update_every, "losses": losses}, f)
+
+    # Training loop
     for i_episode in range(1, max_episodes + 1):
-        ob, _ = env.reset()
+        ob, _info = env.reset()
+        agent.reset()
         total_reward = 0
         for t in range(max_timesteps):
-            if render:
-                env.render()
-
-            ob_tensor = torch.tensor(ob, dtype=torch.float32).unsqueeze(0)
-            action, _ = agent.policy.sample(ob_tensor)
-            action = action.detach().numpy()[0]
-            next_ob, reward, done, trunc, _ = env.step(action)
-            replay_buffer.store(ob, action, reward, next_ob, done)
-
-            ob = next_ob
+            timestep += 1
+            done = False
+            a = agent.act(ob)
+            (ob_new, reward, done, trunc, _info) = env.step(a)
             total_reward += reward
-
-            if replay_buffer.size > 1000:
-                loss = agent.train(replay_buffer, batch_size=256, iter_fit=train_iter)
-                losses.extend(loss)
-
+            agent.store_transition((ob, a, reward, ob_new, done))
+            ob = ob_new
             if done or trunc:
                 break
+
+        losses.extend(agent.train(train_iter))
 
         rewards.append(total_reward)
         lengths.append(t)
 
+        # Save every 500 episodes
         if i_episode % 500 == 0:
-            torch.save(agent.policy.state_dict(),
-                       f'./results/SAC_{env_name}_{i_episode}-t{train_iter}-l{lr}-s{random_seed}.pth')
-            with open(f"./results/SAC_{env_name}_statistics.pkl", 'wb') as f:
-                pickle.dump({"rewards": rewards, "lengths": lengths, "losses": losses}, f)
+            print("########## Saving a checkpoint... ##########")
+            torch.save(agent.state(), f'./results/{opts.agent}_{env_name}_{i_episode}-eps{eps}-t{train_iter}-l{lr}-s{random_seed}.pth')
+            save_statistics()
 
+        # Logging
         if i_episode % 20 == 0:
             avg_reward = np.mean(rewards[-20:])
             avg_length = int(np.mean(lengths[-20:]))
-            print(f'Episode {i_episode} \t avg length: {avg_length} \t reward: {avg_reward}')
-
-    env.close()
-
+            print('Episode {} \t avg length: {} \t reward: {}'.format(i_episode, avg_length, avg_reward))
+    save_statistics()
 
 if __name__ == '__main__':
     main()
-
-
