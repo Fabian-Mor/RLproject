@@ -19,13 +19,16 @@ class UnsupportedSpace(Exception):
         super().__init__(self.message)
 
 class QFunction(Feedforward):
-    def __init__(self, observation_dim, action_dim, hidden_sizes=[100, 100],
-                 learning_rate=0.0002):
-        super().__init__(input_size=observation_dim + action_dim, hidden_sizes=hidden_sizes, output_size=1)
+    def __init__(self, observation_dim, action_dim, hidden_sizes=[100,100],
+                 learning_rate = 0.0002):
+        super().__init__(input_size=observation_dim + action_dim, hidden_sizes=hidden_sizes,
+                         output_size=1)
         self.bns = nn.ModuleList([
             nn.BatchNorm1d(size) for size in hidden_sizes
         ])
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate, eps=0.000001)
+        self.optimizer=torch.optim.Adam(self.parameters(),
+                                        lr=learning_rate,
+                                        eps=0.000001)
         self.loss = torch.nn.SmoothL1Loss()
 
     def forward(self, x):
@@ -37,15 +40,13 @@ class QFunction(Feedforward):
             x = activation(x)
         return self.layers[-1](x)
 
-    def fit(self, observations, actions, targets):
-        self.train()
+    def fit(self, observations, actions, targets): # all arguments should be torch tensors
+        self.train() # put model in training mode
         self.optimizer.zero_grad()
+        # Forward pass
 
-        # Forward pass with normalization
-        inputs = torch.hstack([observations, actions])
-        pred = self.forward(inputs)
-
-        # Compute loss
+        pred = self.Q_value(observations,actions)
+        # Compute Loss
         loss = self.loss(pred, targets)
 
         # Backward pass
@@ -54,8 +55,7 @@ class QFunction(Feedforward):
         return loss.item()
 
     def Q_value(self, observations, actions):
-        return self.forward(torch.hstack([observations, actions]))
-
+        return self.forward(torch.hstack([observations,actions]))
 
 class Policy(Feedforward):
     def __init__(self, observation_dim, action_dim, hidden_sizes=[100, 100], learning_rate=0.0003):
@@ -63,10 +63,6 @@ class Policy(Feedforward):
         self.optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate)
         self.log_std_min = -20
         self.log_std_max = 2
-
-    def forward(self, observation):
-        x = super().forward(observation)
-        return x
 
     def get_action(self, observation):
         mean, log_std = self.forward(observation).chunk(2, dim=-1)
@@ -90,7 +86,6 @@ class Policy(Feedforward):
         policy_loss.backward()
         self.optimizer.step()
         return policy_loss.item()
-
 
 class SACAgent:
     def __init__(self, observation_space, action_space, **userconfig):
@@ -124,11 +119,18 @@ class SACAgent:
                              hidden_sizes=self._config["hidden_sizes_actor"], learning_rate=self._config["learning_rate_actor"])
         self.q1 = QFunction(self._obs_dim, self._action_dim, self._config["hidden_sizes_critic"],
                             self._config["learning_rate_critic"])
+        self.q2 = QFunction(self._obs_dim, self._action_dim, self._config["hidden_sizes_critic"],
+                            self._config["learning_rate_critic"])
         print(self.q1)
+        print(self.q2)
         print(self.policy)
         self.target_entropy = -np.prod(action_space.shape)
         self.log_alpha = torch.zeros(1, requires_grad=True)
         self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=3e-4)
+        self._copy_nets()
+
+    def _copy_nets(self):
+        pass
 
     def act(self, observation):
         with torch.no_grad():
@@ -141,6 +143,22 @@ class SACAgent:
     def store_transition(self, transition):
         self.buffer.add_transition(transition)
 
+    def state(self):
+        return {
+            "policy": self.policy.state_dict(),
+            "q1": self.q1.state_dict(),
+            "q2": self.q2.state_dict()
+        }
+
+    def restore_state(self, state):
+        self.policy.load_state_dict(state["policy"])
+        self.q1.load_state_dict(state["q1"])
+        self.q2.load_state_dict(state["q2"])
+        self._copy_nets()  # Ensure target networks are properly synchronized
+
+    def reset(self):
+        pass  # SAC does not use action noise; no reset needed
+
     def train(self, iter_fit=256):
         losses = []
         for _ in range(iter_fit):
@@ -152,24 +170,66 @@ class SACAgent:
 
             # Calculate Q-targets
             with torch.no_grad():
+                # Get next actions and their log probs from current policy
                 next_actions, next_log_probs = self.policy.get_action(next_obs)
+
+                # Get Q-values for next states from both target networks
                 q1_next = self.q1.Q_value(next_obs, next_actions)
+                q2_next = self.q2.Q_value(next_obs, next_actions)
+
+                # Take minimum Q-value for robustness
+                min_q_next = torch.min(q1_next, q2_next)
+
+                # Calculate entropy term
                 alpha = self._config["entropy_coeff"]
-                q_target = rewards.unsqueeze(-1) + self._config["discount"] * (1 - dones.unsqueeze(-1)) * \
-                           (q1_next - alpha * next_log_probs)
+                entropy_term = alpha * next_log_probs
+
+                # Compute targets for Q-functions
+                q_target = rewards.unsqueeze(-1) + \
+                           self._config["discount"] * (1 - dones.unsqueeze(-1)) * \
+                           (min_q_next - entropy_term)
 
             # Update Q-functions
-            q1_loss = self.q1.fit(observations, actions, q_target.detach())
+            # First Q-function
+            current_q1 = self.q1.Q_value(observations, actions)
+            q1_loss = self.q1.loss(current_q1, q_target.detach())
+            self.q1.optimizer.zero_grad()
+            q1_loss.backward()
+            self.q1.optimizer.step()
+
+            # Second Q-function
+            current_q2 = self.q2.Q_value(observations, actions)
+            q2_loss = self.q2.loss(current_q2, q_target.detach())
+            self.q2.optimizer.zero_grad()
+            q2_loss.backward()
+            self.q2.optimizer.step()
 
             # Update policy
+            # Get actions and log probs from current policy
             new_actions, log_probs = self.policy.get_action(observations)
+
+            # Calculate Q-values for new actions
             q1_new = self.q1.Q_value(observations, new_actions)
-            policy_loss = self.policy.fit(observations, log_probs, q1_new)
+            q2_new = self.q2.Q_value(observations, new_actions)
+            min_q_new = torch.min(q1_new, q2_new)
+
+            # Calculate policy loss (negative for gradient ascent)
+            policy_loss = (alpha * log_probs - min_q_new).mean()
+
+            # Update policy
+            self.policy.optimizer.zero_grad()
+            policy_loss.backward()
+            self.policy.optimizer.step()
 
             # Store losses for logging
-            losses.append((q1_loss, policy_loss))
+            losses.append((q1_loss.item(), q2_loss.item(), policy_loss.item()))
 
         return losses
+
+    def _soft_update(self, source, target):
+        tau = self._config["tau"]
+        for source_param, target_param in zip(source.parameters(), target.parameters()):
+            target_param.data.copy_(tau * source_param.data + (1.0 - tau) * target_param.data)
 
     def reset(self):
         pass
