@@ -430,7 +430,9 @@ def main():
         hidden_size=256,
         target_update_interval=1,
         replay_size=100000000,
-        cuda=False
+        cuda=False,
+        use_target=True,
+        batch_norm=False
     )
 
     # Set environment

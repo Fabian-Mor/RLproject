@@ -18,12 +18,13 @@ class SAC(object):
         self.automatic_entropy_tuning = args.automatic_entropy_tuning
 
         self.device = torch.device("cuda" if args.cuda else "cpu")
-
-        self.critic = QNetwork(num_inputs, action_space.shape[0], args.hidden_size).to(device=self.device)
+        self.batch_norm = args.batch_norm
+        self.critic = QNetwork(num_inputs, action_space.shape[0], args.hidden_size, batch_norm=args.batch_norm).to(device=self.device)
         self.critic_optim = Adam(self.critic.parameters(), lr=args.lr)
-
-        self.critic_target = QNetwork(num_inputs, action_space.shape[0], args.hidden_size).to(self.device)
-        hard_update(self.critic_target, self.critic)
+        self.use_target = args.use_target
+        if args.use_target:
+            self.critic_target = QNetwork(num_inputs, action_space.shape[0], args.hidden_size, batch_norm=args.batch_norm).to(self.device)
+            hard_update(self.critic_target, self.critic)
         self.memory = ReplayMemory(args.replay_size, 1)
         self.batch_size = args.batch_size
 
@@ -65,7 +66,22 @@ class SAC(object):
 
             with torch.no_grad():
                 next_state_action, next_state_log_pi, _ = self.policy.sample(next_state_batch)
-                qf1_next_target, qf2_next_target = self.critic_target(next_state_batch, next_state_action)
+                if self.batch_norm:
+                    # use the trick of the paper crossq
+                    combined_obs = torch.cat([state_batch, next_state_batch], dim=0)
+                    combined_actions = torch.cat([action_batch, next_state_action], dim=0)
+                    if self.use_target:
+                        qf1_next_target_all, qf2_next_target_all = self.critic_target(combined_obs, combined_actions)
+                    else:
+                        qf1_next_target_all, qf2_next_target_all = self.critic(combined_obs, combined_actions)
+                    _, qf1_next_target = torch.chunk(qf1_next_target_all, 2, dim=0)
+                    _, qf2_next_target = torch.chunk(qf2_next_target_all, 2, dim=0)
+                else:
+                    if self.use_target:
+                        qf1_next_target, qf2_next_target = self.critic_target(next_state_batch, next_state_action)
+                    else:
+                        qf1_next_target, qf2_next_target = self.critic(next_state_batch, next_state_action)
+
                 min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - self.alpha * next_state_log_pi
                 next_q_value = reward_batch + self.gamma * (min_qf_next_target)
             qf1, qf2 = self.critic(state_batch, action_batch)  # Two Q-functions to mitigate positive bias in the policy improvement step
@@ -96,7 +112,7 @@ class SAC(object):
                 self.alpha_optim.step()
 
                 self.alpha = self.log_alpha.exp()
-            if updates % self.target_update_interval == 0:
+            if self.use_target and updates % self.target_update_interval == 0:
                 soft_update(self.critic_target, self.critic, self.tau)
 
             losses.append((qf1_loss.item(), qf2_loss.item(), policy_loss.item()))
