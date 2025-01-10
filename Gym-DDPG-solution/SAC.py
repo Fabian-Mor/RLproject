@@ -5,9 +5,10 @@ import gymnasium as gym
 from gymnasium import spaces
 import optparse
 import pickle
-
+from types import SimpleNamespace
 import memory as mem
 from feedforward import Feedforward
+from sac_standard import SAC
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 torch.set_num_threads(1)
@@ -396,7 +397,7 @@ def main():
                          dest='env_name', default="Pendulum-v1",
                          help='Environment (default %default)')
     optParser.add_option('-a', '--agent', action='store', type='string',
-                         dest='agent', default="DDPG",
+                         dest='agent', default="SAC2",
                          help='Agent type (DDPG or SAC, default %default)')
     optParser.add_option('-n', '--eps', action='store', type='float',
                          dest='eps', default=0.1,
@@ -418,12 +419,26 @@ def main():
                          help='Random seed (default %default)')
     opts, args = optParser.parse_args()
 
+    args = SimpleNamespace(
+        lr=0.0003,
+        policy="Gaussian",
+        gamma=0.99,
+        tau=0.005,
+        alpha=0.2,
+        batch_size=128,
+        automatic_entropy_tuning=True,
+        hidden_size=256,
+        target_update_interval=1,
+        replay_size=100000000,
+        cuda=False
+    )
+
     # Set environment
     env_name = opts.env_name
     env = gym.make(env_name)
     render = False
     max_episodes = opts.max_episodes
-    max_timesteps = 2000
+    max_timesteps = 100000
     train_iter = opts.train
     eps = opts.eps
     lr = opts.lr
@@ -467,8 +482,8 @@ def main():
             done = False
             a = agent.act(ob)
             (ob_new, reward, done, trunc, _info) = env.step(a)
-            total_reward += reward
             agent.store_transition((ob, a, reward, ob_new, done))
+            total_reward += reward
             ob = ob_new
             if done or trunc:
                 break
@@ -481,7 +496,8 @@ def main():
         # Save every 500 episodes
         if i_episode % 500 == 0:
             print("########## Saving a checkpoint... ##########")
-            torch.save(agent.state(), f'./results/{opts.agent}_{env_name}_{i_episode}-eps{eps}-t{train_iter}-l{lr}-s{random_seed}.pth')
+            agent.state(opts.env_name)
+            # torch.save(agent.state(), f'./results/{opts.agent}_{env_name}_{i_episode}-eps{eps}-t{train_iter}-l{lr}-s{random_seed}.pth')
             save_statistics()
 
         # Logging

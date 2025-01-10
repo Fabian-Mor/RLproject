@@ -1,11 +1,9 @@
 import argparse
-import datetime
 import gymnasium as gym
 import numpy as np
 import itertools
 import torch
-from sac import SAC
-from torch.utils.tensorboard import SummaryWriter
+from sac_standard import SAC
 from replay_memory import ReplayMemory
 
 parser = argparse.ArgumentParser(description='PyTorch Soft Actor-Critic Args')
