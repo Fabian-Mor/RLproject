@@ -441,6 +441,8 @@ def main():
     elif opts.agent == "SAC":
         agent = SACAgent(env.observation_space, env.action_space,
                          learning_rate_actor=lr)
+    elif opts.agent == "SAC2":
+        agent = SAC(env.observation_space.shape[0], env.action_space, args)
     else:
         raise ValueError(f"Unsupported agent type: {opts.agent}")
 

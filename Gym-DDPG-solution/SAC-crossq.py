@@ -12,6 +12,110 @@ from feedforward import Feedforward
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 torch.set_num_threads(1)
 
+class BatchRenorm(torch.jit.ScriptModule):
+    def __init__(
+        self,
+        num_features: int,
+        eps: float = 1e-3,
+        momentum: float = 0.01,
+        affine: bool = True,
+    ):
+        super().__init__()
+        self.register_buffer(
+            "running_mean", torch.zeros(num_features, dtype=torch.float)
+        )
+        self.register_buffer(
+            "running_std", torch.ones(num_features, dtype=torch.float)
+        )
+        self.register_buffer(
+            "num_batches_tracked", torch.tensor(0, dtype=torch.long)
+        )
+        self.weight = torch.nn.Parameter(
+            torch.ones(num_features, dtype=torch.float)
+        )
+        self.bias = torch.nn.Parameter(
+            torch.zeros(num_features, dtype=torch.float)
+        )
+        self.affine = affine
+        self.eps = eps
+        self.step = 0
+        self.momentum = momentum
+
+    def _check_input_dim(self, x: torch.Tensor) -> None:
+        raise NotImplementedError()  # pragma: no cover
+
+    @property
+    def rmax(self) -> torch.Tensor:
+        return (2 / 35000 * self.num_batches_tracked + 25 / 35).clamp_(
+            1.0, 3.0
+        )
+
+    @property
+    def dmax(self) -> torch.Tensor:
+        return (5 / 20000 * self.num_batches_tracked - 25 / 20).clamp_(
+            0.0, 5.0
+        )
+
+    def forward(self, x: torch.Tensor, mask = None) -> torch.Tensor:
+        '''
+        Mask is a boolean tensor used for indexing, where True values are padded
+        i.e for 3D input, mask should be of shape (batch_size, seq_len)
+        mask is used to prevent padded values from affecting the batch statistics
+        '''
+        self._check_input_dim(x)
+        if x.dim() > 2:
+            x = x.transpose(1, -1)
+        if self.training:
+            dims = [i for i in range(x.dim() - 1)]
+            if mask is not None:
+                z = x[~mask]
+                batch_mean = z.mean(0)
+                batch_std = z.std(0, unbiased=False) + self.eps
+            else:
+                batch_mean = x.mean(dims)
+                batch_std = x.std(dims, unbiased=False) + self.eps
+
+            r = (
+                batch_std.detach() / self.running_std.view_as(batch_std)
+            ).clamp_(1 / self.rmax, self.rmax)
+            d = (
+                (batch_mean.detach() - self.running_mean.view_as(batch_mean))
+                / self.running_std.view_as(batch_std)
+            ).clamp_(-self.dmax, self.dmax)
+            x = (x - batch_mean) / batch_std * r + d
+            self.running_mean += self.momentum * (
+                batch_mean.detach() - self.running_mean
+            )
+            self.running_std += self.momentum * (
+                batch_std.detach() - self.running_std
+            )
+            self.num_batches_tracked += 1
+        else:
+            x = (x - self.running_mean) / self.running_std
+        if self.affine:
+            x = self.weight * x + self.bias
+        if x.dim() > 2:
+            x = x.transpose(1, -1)
+        return x
+
+
+class BatchRenorm1d(BatchRenorm):
+    def _check_input_dim(self, x: torch.Tensor) -> None:
+        if x.dim() not in [2, 3]:
+            raise ValueError("expected 2D or 3D input (got {x.dim()}D input)")
+
+
+class BatchRenorm2d(BatchRenorm):
+    def _check_input_dim(self, x: torch.Tensor) -> None:
+        if x.dim() != 4:
+            raise ValueError("expected 4D input (got {x.dim()}D input)")
+
+
+class BatchRenorm3d(BatchRenorm):
+    def _check_input_dim(self, x: torch.Tensor) -> None:
+        if x.dim() != 5:
+            raise ValueError("expected 5D input (got {x.dim()}D input)")
+
 class UnsupportedSpace(Exception):
     """Exception raised when the Sensor or Action space are not compatible."""
     def __init__(self, message="Unsupported Space"):
@@ -24,7 +128,10 @@ class QFunction(Feedforward):
         super().__init__(input_size=observation_dim + action_dim, hidden_sizes=hidden_sizes,
                          output_size=1)
         self.bns = nn.ModuleList([
-            nn.BatchNorm1d(size) for size in hidden_sizes
+            BatchRenorm1d(size) for size in hidden_sizes
+        ])
+        self.activations = nn.ModuleList([
+            nn.ReLU() for size in hidden_sizes
         ])
         self.optimizer=torch.optim.Adam(self.parameters(),
                                         lr=learning_rate,
@@ -32,13 +139,12 @@ class QFunction(Feedforward):
         self.loss = torch.nn.SmoothL1Loss()
 
     def forward(self, x):
-        for layer, bn, activation in zip(self.layers[:-1], self.bns, self.activations[:-1]):
-            x = layer(x)
-            # Apply BatchNorm before activation
-            if x.shape[0] > 1:  # Only apply BatchNorm for batch size > 1
-                x = bn(x)
-            x = activation(x)
-        return self.layers[-1](x)
+        for layer,activation_fun, bn in zip(self.layers, self.activations, self.bns):
+            x = activation_fun(bn(layer(x)))
+        if self.output_activation is not None:
+            return self.output_activation(self.readout(x))
+        else:
+            return self.readout(x)
 
     def fit(self, observations, actions, targets): # all arguments should be torch tensors
         self.train() # put model in training mode
@@ -60,9 +166,23 @@ class QFunction(Feedforward):
 class Policy(Feedforward):
     def __init__(self, observation_dim, action_dim, hidden_sizes=[100, 100], learning_rate=0.0003):
         super().__init__(input_size=observation_dim, hidden_sizes=hidden_sizes, output_size=action_dim)
+        self.bns = nn.ModuleList([
+            BatchRenorm1d(size) for size in hidden_sizes
+        ])
+        self.activations = nn.ModuleList([
+            nn.ReLU() for size in hidden_sizes
+        ])
         self.optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate)
         self.log_std_min = -20
         self.log_std_max = 2
+
+    def forward(self, x):
+        for layer,activation_fun, bn in zip(self.layers, self.activations, self.bns):
+            x = activation_fun(bn(layer(x)))
+        if self.output_activation is not None:
+            return self.output_activation(self.readout(x))
+        else:
+            return self.readout(x)
 
     def get_action(self, observation):
         mean, log_std = self.forward(observation).chunk(2, dim=-1)
@@ -160,6 +280,9 @@ class SACAgent:
         pass  # SAC does not use action noise; no reset needed
 
     def train(self, iter_fit=256):
+        self.q1.train()
+        self.q2.train()
+        self.policy.train()
         losses = []
         for _ in range(iter_fit):
             # Sample batch from replay buffer
@@ -173,40 +296,38 @@ class SACAgent:
                 # Get next actions and their log probs from current policy
                 next_actions, next_log_probs = self.policy.get_action(next_obs)
 
-                # Get Q-values for next states from both target networks
-                q1_all = self.q1.Q_value(torch.concat([observations, next_obs]),
-                                                torch.concat([actions, next_actions]))
-                q2_all = self.q2.Q_value(torch.concat([observations, next_obs]),
-                                                torch.concat([actions, next_actions]))
-                q1, q1_next = torch.chunk(q1_all, 2)
-                q2, q2_next = torch.chunk(q2_all, 2)
+                # Concatenate states and actions for CrossQ
+                combined_obs = torch.cat([observations, next_obs], dim=0)
+                combined_actions = torch.cat([actions, next_actions], dim=0)
+
+                # Get Q-values using target networks with combined batch
+                target_q1 = self.q1.Q_value(combined_obs, combined_actions)
+                target_q2 = self.q2.Q_value(combined_obs, combined_actions)
+
+                # Split back to current and next
+                _, next_q1 = torch.chunk(target_q1, 2, dim=0)
+                _, next_q2 = torch.chunk(target_q2, 2, dim=0)
 
                 # Take minimum Q-value for robustness
-                min_q_next = torch.min(q1_next, q2_next)
+                min_next_q = torch.min(next_q1, next_q2)
 
-                # Calculate entropy term
                 alpha = self._config["entropy_coeff"]
-                entropy_term = alpha * next_log_probs
-
-                # Compute targets for Q-functions
                 q_target = rewards.unsqueeze(-1) + \
-                           self._config["discount"] * (1 - dones.unsqueeze(-1)) * \
-                           (min_q_next - entropy_term)
+                           (1 - dones.unsqueeze(-1)) * self._config["discount"] * \
+                           (min_next_q - alpha * next_log_probs)
 
             # Update Q-functions
             # First Q-function
-            q1_all = self.q1.Q_value(torch.concat([observations, next_obs]),
-                                     torch.concat([actions, next_actions]))
-            current_q1, _ = torch.chunk(q1_all, 2)
+            q1_all = self.q1.Q_value(combined_obs, combined_actions)
+            current_q1, _ = torch.chunk(q1_all, 2, dim=0)
             q1_loss = self.q1.loss(current_q1, q_target.detach())
             self.q1.optimizer.zero_grad()
             q1_loss.backward()
             self.q1.optimizer.step()
 
             # Second Q-function
-            q2_all = self.q2.Q_value(torch.concat([observations, next_obs]),
-                                     torch.concat([actions, next_actions]))
-            current_q2, _ = torch.chunk(q2_all, 2)
+            q2_all = self.q2.Q_value(combined_obs, combined_actions)
+            current_q2, _ = torch.chunk(q2_all, 2, dim=0)
             q2_loss = self.q2.loss(current_q2, q_target.detach())
             self.q2.optimizer.zero_grad()
             q2_loss.backward()
@@ -235,7 +356,9 @@ class SACAgent:
 
             # Store losses for logging
             losses.append((q1_loss.item(), q2_loss.item(), policy_loss.item()))
-
+        self.q1.eval()
+        self.q2.eval()
+        self.policy.eval()
         return losses
 
     def _soft_update(self, source, target):
@@ -243,160 +366,6 @@ class SACAgent:
 
     def reset(self):
         pass
-
-
-class OUNoise():
-    def __init__(self, shape, theta: float = 0.15, dt: float = 1e-2):
-        self._shape = shape
-        self._theta = theta
-        self._dt = dt
-        self.noise_prev = np.zeros(self._shape)
-        self.reset()
-
-    def __call__(self) -> np.ndarray:
-        noise = (
-            self.noise_prev
-            + self._theta * ( - self.noise_prev) * self._dt
-            + np.sqrt(self._dt) * np.random.normal(size=self._shape)
-        )
-        self.noise_prev = noise
-        return noise
-
-    def reset(self) -> None:
-        self.noise_prev = np.zeros(self._shape)
-
-
-class DDPGAgent(object):
-    """
-    Agent implementing Q-learning with NN function approximation.
-    """
-    def __init__(self, observation_space, action_space, **userconfig):
-
-        if not isinstance(observation_space, spaces.box.Box):
-            raise UnsupportedSpace('Observation space {} incompatible ' \
-                                   'with {}. (Require: Box)'.format(observation_space, self))
-        if not isinstance(action_space, spaces.box.Box):
-            raise UnsupportedSpace('Action space {} incompatible with {}.' \
-                                   ' (Require Box)'.format(action_space, self))
-
-        self._observation_space = observation_space
-        self._obs_dim=self._observation_space.shape[0]
-        self._action_space = action_space
-        self._action_n = action_space.shape[0]
-        self._config = {
-            "eps": 0.1,            # Epsilon: noise strength to add to policy
-            "discount": 0.95,
-            "buffer_size": int(1e6),
-            "batch_size": 128,
-            "learning_rate_actor": 0.00001,
-            "learning_rate_critic": 0.0001,
-            "hidden_sizes_actor": [128,128],
-            "hidden_sizes_critic": [128,128,64],
-            "update_target_every": 100,
-            "use_target_net": True
-        }
-        self._config.update(userconfig)
-        self._eps = self._config['eps']
-
-        self.action_noise = OUNoise((self._action_n))
-
-        self.buffer = mem.Memory(max_size=self._config["buffer_size"])
-
-        # Q Network
-        self.Q = QFunction(observation_dim=self._obs_dim,
-                           action_dim=self._action_n,
-                           hidden_sizes= self._config["hidden_sizes_critic"],
-                           learning_rate = self._config["learning_rate_critic"])
-        # target Q Network
-        self.Q_target = QFunction(observation_dim=self._obs_dim,
-                                  action_dim=self._action_n,
-                                  hidden_sizes= self._config["hidden_sizes_critic"],
-                                  learning_rate = 0)
-
-        self.policy = Feedforward(input_size=self._obs_dim,
-                                  hidden_sizes= self._config["hidden_sizes_actor"],
-                                  output_size=self._action_n,
-                                  activation_fun = torch.nn.ReLU(),
-                                  output_activation = torch.nn.Tanh())
-        self.policy_target = Feedforward(input_size=self._obs_dim,
-                                         hidden_sizes= self._config["hidden_sizes_actor"],
-                                         output_size=self._action_n,
-                                         activation_fun = torch.nn.ReLU(),
-                                         output_activation = torch.nn.Tanh())
-        print(self.Q)
-        print(self.Q_target)
-        print(self.policy)
-        print(self.policy_target)
-        self._copy_nets()
-
-        self.optimizer=torch.optim.Adam(self.policy.parameters(),
-                                        lr=self._config["learning_rate_actor"],
-                                        eps=0.000001)
-        self.train_iter = 0
-
-    def _copy_nets(self):
-        self.Q_target.load_state_dict(self.Q.state_dict())
-        self.policy_target.load_state_dict(self.policy.state_dict())
-
-    def act(self, observation, eps=None):
-        if eps is None:
-            eps = self._eps
-        #
-        action = self.policy.predict(observation) + eps*self.action_noise()  # action in -1 to 1 (+ noise)
-        action = self._action_space.low + (action + 1.0) / 2.0 * (self._action_space.high - self._action_space.low)
-        return action
-
-    def store_transition(self, transition):
-        self.buffer.add_transition(transition)
-
-    def state(self):
-        return (self.Q.state_dict(), self.policy.state_dict())
-
-    def restore_state(self, state):
-        self.Q.load_state_dict(state[0])
-        self.policy.load_state_dict(state[1])
-        self._copy_nets()
-
-    def reset(self):
-        self.action_noise.reset()
-
-    def train(self, iter_fit=32):
-        to_torch = lambda x: torch.from_numpy(x.astype(np.float32))
-        losses = []
-        self.train_iter+=1
-        if self._config["use_target_net"] and self.train_iter % self._config["update_target_every"] == 0:
-            self._copy_nets()
-        for i in range(iter_fit):
-
-            # sample from the replay buffer
-            data=self.buffer.sample(batch=self._config['batch_size'])
-            s = to_torch(np.stack(data[:,0])) # s_t
-            a = to_torch(np.stack(data[:,1])) # a_t
-            rew = to_torch(np.stack(data[:,2])[:,None]) # rew  (batchsize,1)
-            s_prime = to_torch(np.stack(data[:,3])) # s_t+1
-            done = to_torch(np.stack(data[:,4])[:,None]) # done signal  (batchsize,1)
-
-            if self._config["use_target_net"]:
-                q_prime = self.Q_target.Q_value(s_prime, self.policy_target.forward(s_prime))
-            else:
-                q_prime = self.Q.Q_value(s_prime, self.policy.forward(s_prime))
-            # target
-            gamma=self._config['discount']
-            td_target = rew + gamma * (1.0-done) * q_prime
-
-            # optimize the Q objective
-            fit_loss = self.Q.fit(s, a, td_target)
-
-            # optimize actor objective
-            self.optimizer.zero_grad()
-            q = self.Q.Q_value(s, self.policy.forward(s))
-            actor_loss = -torch.mean(q)
-            actor_loss.backward()
-            self.optimizer.step()
-
-            losses.append((fit_loss, actor_loss.item()))
-
-        return losses
 
 
 def main():

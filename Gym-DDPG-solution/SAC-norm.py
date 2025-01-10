@@ -12,6 +12,111 @@ from feedforward import Feedforward
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 torch.set_num_threads(1)
 
+class BatchRenorm(torch.jit.ScriptModule):
+    def __init__(
+        self,
+        num_features: int,
+        eps: float = 1e-3,
+        momentum: float = 0.01,
+        affine: bool = True,
+    ):
+        super().__init__()
+        self.register_buffer(
+            "running_mean", torch.zeros(num_features, dtype=torch.float)
+        )
+        self.register_buffer(
+            "running_std", torch.ones(num_features, dtype=torch.float)
+        )
+        self.register_buffer(
+            "num_batches_tracked", torch.tensor(0, dtype=torch.long)
+        )
+        self.weight = torch.nn.Parameter(
+            torch.ones(num_features, dtype=torch.float)
+        )
+        self.bias = torch.nn.Parameter(
+            torch.zeros(num_features, dtype=torch.float)
+        )
+        self.affine = affine
+        self.eps = eps
+        self.step = 0
+        self.momentum = momentum
+
+    def _check_input_dim(self, x: torch.Tensor) -> None:
+        raise NotImplementedError()  # pragma: no cover
+
+    @property
+    def rmax(self) -> torch.Tensor:
+        return (2 / 35000 * self.num_batches_tracked + 25 / 35).clamp_(
+            1.0, 3.0
+        )
+
+    @property
+    def dmax(self) -> torch.Tensor:
+        return (5 / 20000 * self.num_batches_tracked - 25 / 20).clamp_(
+            0.0, 5.0
+        )
+
+    def forward(self, x: torch.Tensor, mask = None) -> torch.Tensor:
+        '''
+        Mask is a boolean tensor used for indexing, where True values are padded
+        i.e for 3D input, mask should be of shape (batch_size, seq_len)
+        mask is used to prevent padded values from affecting the batch statistics
+        '''
+        self._check_input_dim(x)
+        if x.dim() > 2:
+            x = x.transpose(1, -1)
+        if self.training:
+            dims = [i for i in range(x.dim() - 1)]
+            if mask is not None:
+                z = x[~mask]
+                batch_mean = z.mean(0)
+                batch_std = z.std(0, unbiased=False) + self.eps
+            else:
+                batch_mean = x.mean(dims)
+                batch_std = x.std(dims, unbiased=False) + self.eps
+
+            r = (
+                batch_std.detach() / self.running_std.view_as(batch_std)
+            ).clamp_(1 / self.rmax, self.rmax)
+            d = (
+                (batch_mean.detach() - self.running_mean.view_as(batch_mean))
+                / self.running_std.view_as(batch_std)
+            ).clamp_(-self.dmax, self.dmax)
+            x = (x - batch_mean) / batch_std * r + d
+            self.running_mean += self.momentum * (
+                batch_mean.detach() - self.running_mean
+            )
+            self.running_std += self.momentum * (
+                batch_std.detach() - self.running_std
+            )
+            self.num_batches_tracked += 1
+        else:
+            x = (x - self.running_mean) / self.running_std
+        if self.affine:
+            x = self.weight * x + self.bias
+        if x.dim() > 2:
+            x = x.transpose(1, -1)
+        return x
+
+
+class BatchRenorm1d(BatchRenorm):
+    def _check_input_dim(self, x: torch.Tensor) -> None:
+        if x.dim() not in [2, 3]:
+            raise ValueError("expected 2D or 3D input (got {x.dim()}D input)")
+
+
+class BatchRenorm2d(BatchRenorm):
+    def _check_input_dim(self, x: torch.Tensor) -> None:
+        if x.dim() != 4:
+            raise ValueError("expected 4D input (got {x.dim()}D input)")
+
+
+class BatchRenorm3d(BatchRenorm):
+    def _check_input_dim(self, x: torch.Tensor) -> None:
+        if x.dim() != 5:
+            raise ValueError("expected 5D input (got {x.dim()}D input)")
+
+
 class UnsupportedSpace(Exception):
     """Exception raised when the Sensor or Action space are not compatible."""
     def __init__(self, message="Unsupported Space"):
@@ -24,7 +129,7 @@ class QFunction(Feedforward):
         super().__init__(input_size=observation_dim + action_dim, hidden_sizes=hidden_sizes,
                          output_size=1)
         self.bns = nn.ModuleList([
-            nn.BatchNorm1d(size) for size in hidden_sizes
+            BatchRenorm1d(size) for size in hidden_sizes
         ])
         self.optimizer=torch.optim.Adam(self.parameters(),
                                         lr=learning_rate,
@@ -32,13 +137,13 @@ class QFunction(Feedforward):
         self.loss = torch.nn.SmoothL1Loss()
 
     def forward(self, x):
-        for layer, bn, activation in zip(self.layers[:-1], self.bns, self.activations[:-1]):
-            x = layer(x)
-            # Apply BatchNorm before activation
-            if x.shape[0] > 1:  # Only apply BatchNorm for batch size > 1
-                x = bn(x)
-            x = activation(x)
-        return self.layers[-1](x)
+        for layer,activation_fun, bn in zip(self.layers[:-1], self.activations[:-1], self.bns):
+            x = activation_fun((layer(x)))
+        x = self.activations[-1](self.layers[-1](x))
+        if self.output_activation is not None:
+            return self.output_activation(self.readout(x))
+        else:
+            return self.readout(x)
 
     def fit(self, observations, actions, targets): # all arguments should be torch tensors
         self.train() # put model in training mode
@@ -121,11 +226,12 @@ class SACAgent:
                             self._config["learning_rate_critic"])
         self.q2 = QFunction(self._obs_dim, self._action_dim, self._config["hidden_sizes_critic"],
                             self._config["learning_rate_critic"])
-
         self.q1_target = QFunction(self._obs_dim, self._action_dim, self._config["hidden_sizes_critic"], learning_rate=0)
         self.q2_target = QFunction(self._obs_dim, self._action_dim, self._config["hidden_sizes_critic"], learning_rate=0)
         print(self.q1)
         print(self.q2)
+        print(self.q1_target)
+        print(self.q2_target)
         print(self.policy)
         self.target_entropy = -np.prod(action_space.shape)
         self.log_alpha = torch.zeros(1, requires_grad=True)
@@ -183,9 +289,9 @@ class SACAgent:
 
                 # Get Q-values for next states from both target networks
                 q1_all = self.q1_target.Q_value(torch.concat([observations, next_obs]),
-                                                torch.concat([actions, next_actions]))
+                                         torch.concat([actions, next_actions]))
                 q2_all = self.q2_target.Q_value(torch.concat([observations, next_obs]),
-                                                torch.concat([actions, next_actions]))
+                                         torch.concat([actions, next_actions]))
                 q1, q1_next = torch.chunk(q1_all, 2)
                 q2, q2_next = torch.chunk(q2_all, 2)
 
@@ -203,18 +309,14 @@ class SACAgent:
 
             # Update Q-functions
             # First Q-function
-            q1_all = self.q1.Q_value(torch.concat([observations, next_obs]),
-                                     torch.concat([actions, next_actions]))
-            current_q1, _ = torch.chunk(q1_all, 2)
+            current_q1 = self.q1.Q_value(observations, actions)
             q1_loss = self.q1.loss(current_q1, q_target.detach())
             self.q1.optimizer.zero_grad()
             q1_loss.backward()
             self.q1.optimizer.step()
 
             # Second Q-function
-            q2_all = self.q2.Q_value(torch.concat([observations, next_obs]),
-                                     torch.concat([actions, next_actions]))
-            current_q2, _ = torch.chunk(q2_all, 2)
+            current_q2 = self.q2.Q_value(observations, actions)
             q2_loss = self.q2.loss(current_q2, q_target.detach())
             self.q2.optimizer.zero_grad()
             q2_loss.backward()
@@ -225,12 +327,8 @@ class SACAgent:
             new_actions, log_probs = self.policy.get_action(observations)
 
             # Calculate Q-values for new actions
-            q1_all = self.q1.Q_value(torch.concat([observations, next_obs]),
-                                     torch.concat([actions, next_actions]))
-            _, q1_new = torch.chunk(q1_all, 2)
-            q2_all = self.q2.Q_value(torch.concat([observations, next_obs]),
-                                     torch.concat([actions, next_actions]))
-            _, q2_new = torch.chunk(q2_all, 2)
+            q1_new = self.q1.Q_value(observations, new_actions)
+            q2_new = self.q2.Q_value(observations, new_actions)
             min_q_new = torch.min(q1_new, q2_new)
 
             # Calculate policy loss (negative for gradient ascent)
@@ -241,6 +339,7 @@ class SACAgent:
             policy_loss.backward()
             self.policy.optimizer.step()
 
+            # Soft update target networks
             self._soft_update(self.q1, self.q1_target)
             self._soft_update(self.q2, self.q2_target)
 
@@ -418,7 +517,7 @@ def main():
                          dest='env_name', default="Pendulum-v1",
                          help='Environment (default %default)')
     optParser.add_option('-a', '--agent', action='store', type='string',
-                         dest='agent', default="DDPG",
+                         dest='agent', default="SAC",
                          help='Agent type (DDPG or SAC, default %default)')
     optParser.add_option('-n', '--eps', action='store', type='float',
                          dest='eps', default=0.1,
