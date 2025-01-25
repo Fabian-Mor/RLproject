@@ -14,9 +14,6 @@ class ReplayMemory:
         self.buffer[self.position] = transition
         self.position = (self.position + 1) % self.capacity
 
-    def clean_array(self, input_data):
-        return input_data[0] if isinstance(input_data, tuple) else input_data
-
     def sample(self, batch_size):
         batch = random.sample(self.buffer, batch_size)
         batch_zip = [np.array(b) for b in zip(*batch)]
@@ -27,6 +24,9 @@ class ReplayMemory:
         #         batch_zip[i][j] = self.clean_array(batch_zip[i][j])
         state, action, reward, next_state, done = map(np.stack, batch_zip)
         return state, action, reward, next_state, done
+
+    def reset(self):
+        self.buffer = []
 
     def __len__(self):
         return len(self.buffer)

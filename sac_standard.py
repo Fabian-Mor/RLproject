@@ -154,6 +154,7 @@ class SAC(object):
 
     def reset(self):
         pass
+        # self.memory.reset()
 
     def store_transition(self, transition):
         self.memory.push(transition)

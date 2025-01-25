@@ -30,7 +30,7 @@ def main():
                          dest='lr', default=0.0001,
                          help='Learning rate for actor/policy (default %default)')
     optParser.add_option('-m', '--maxepisodes', action='store', type='float',
-                         dest='max_episodes', default=200,
+                         dest='max_episodes', default=2000,
                          help='Number of episodes (default %default)')
     optParser.add_option('-u', '--update', action='store', type='float',
                          dest='update_every', default=100,
@@ -65,15 +65,38 @@ def main():
     np.set_printoptions(suppress=True)
     reload(h_env)
 
+    # train defense
+    env = h_env.HockeyEnv(mode=h_env.Mode.TRAIN_DEFENSE)
+    agent = SAC(env.observation_space.shape[0], env.action_space, args)
+    player2 = h_env.BasicOpponent(weak=False)
+    o, info = env.reset()
+
+    rewards = []
+    losses = []
+    timestep = 0
+    for i_episode in range(1, max_episodes + 1):
+        ob, _info = env.reset()
+        total_reward = 0
+        for t in range(max_timesteps):
+            timestep += 1
+            done = False
+            a1 = agent.act(ob)
+            a2 = [0,0.,0,0]
+            (ob_new, reward, done, trunc, _info) = env.step(np.hstack([a1, a2]))
+            agent.store_transition((ob, a1, reward, ob_new, done))
+            total_reward += reward
+            ob = ob_new
+            if done or trunc: break
+        losses.extend(agent.train(train_iter))
+        rewards.append(total_reward)
+
     rewards = []
     lengths = []
     losses = []
     timestep = 0
 
-
+    # train against agent
     env = h_env.HockeyEnv()
-    agent = SAC(env.observation_space.shape[0], env.action_space, args)
-    player2 = h_env.BasicOpponent(weak=False)
     for i_episode in range(1, max_episodes + 1):
         ob, _info = env.reset()
         obs_agent2 = env.obs_agent_two()
