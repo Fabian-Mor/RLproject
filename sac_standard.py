@@ -19,11 +19,15 @@ class SAC(object):
 
         self.device = torch.device("cuda" if args.cuda else "cpu")
         self.batch_norm = args.batch_norm
-        self.critic = QNetwork(num_inputs, action_space.shape[0], args.hidden_size, batch_norm=args.batch_norm).to(device=self.device)
+        self.layer_norm = args.layer_norm
+        self.skip_connection = args.skip_connection
+        self.critic = QNetwork(num_inputs, action_space.shape[0], args.hidden_size, batch_norm=args.batch_norm,
+                               layer_norm=args.layer_norm, skip_connection=args.skip_connection).to(device=self.device)
         self.critic_optim = Adam(self.critic.parameters(), lr=args.lr)
         self.use_target = args.use_target
         if args.use_target:
-            self.critic_target = QNetwork(num_inputs, action_space.shape[0], args.hidden_size, batch_norm=args.batch_norm).to(self.device)
+            self.critic_target = QNetwork(num_inputs, action_space.shape[0], args.hidden_size, batch_norm=args.batch_norm,
+                                          layer_norm=args.layer_norm, skip_connection=args.skip_connection).to(self.device)
             hard_update(self.critic_target, self.critic)
         self.memory = ReplayMemory(args.replay_size, 1)
         self.batch_size = args.batch_size
@@ -66,7 +70,7 @@ class SAC(object):
 
             with torch.no_grad():
                 next_state_action, next_state_log_pi, _ = self.policy.sample(next_state_batch)
-                if self.batch_norm:
+                if self.batch_norm or self.layer_norm:
                     # use the trick of the paper crossq
                     combined_obs = torch.cat([state_batch, next_state_batch], dim=0)
                     combined_actions = torch.cat([action_batch, next_state_action], dim=0)
@@ -126,11 +130,17 @@ class SAC(object):
         if ckpt_path is None:
             ckpt_path = "checkpoints/sac_checkpoint_{}_{}".format(env_name, suffix)
         print('Saving models to {}'.format(ckpt_path))
-        torch.save({'policy_state_dict': self.policy.state_dict(),
+        if self.use_target:
+            torch.save({'policy_state_dict': self.policy.state_dict(),
                     'critic_state_dict': self.critic.state_dict(),
                     'critic_target_state_dict': self.critic_target.state_dict(),
                     'critic_optimizer_state_dict': self.critic_optim.state_dict(),
                     'policy_optimizer_state_dict': self.policy_optim.state_dict()}, ckpt_path)
+        else:
+            torch.save({'policy_state_dict': self.policy.state_dict(),
+                        'critic_state_dict': self.critic.state_dict(),
+                        'critic_optimizer_state_dict': self.critic_optim.state_dict(),
+                        'policy_optimizer_state_dict': self.policy_optim.state_dict()}, ckpt_path)
 
     # Load model parameters
     def restore_state(self, ckpt_path, evaluate=False):
@@ -139,14 +149,16 @@ class SAC(object):
             checkpoint = torch.load(ckpt_path)
             self.policy.load_state_dict(checkpoint['policy_state_dict'])
             self.critic.load_state_dict(checkpoint['critic_state_dict'])
-            self.critic_target.load_state_dict(checkpoint['critic_target_state_dict'])
+            if self.use_target:
+                self.critic_target.load_state_dict(checkpoint['critic_target_state_dict'])
             self.critic_optim.load_state_dict(checkpoint['critic_optimizer_state_dict'])
             self.policy_optim.load_state_dict(checkpoint['policy_optimizer_state_dict'])
 
             if evaluate:
                 self.policy.eval()
                 self.critic.eval()
-                self.critic_target.eval()
+                if self.use_target:
+                    self.critic_target.eval()
             else:
                 self.policy.train()
                 self.critic.train()

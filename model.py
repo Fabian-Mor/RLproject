@@ -33,23 +33,43 @@ class ValueNetwork(nn.Module):
 
 
 class QNetwork(nn.Module):
-    def __init__(self, num_inputs, num_actions, hidden_dim, batch_norm=False):
+    def __init__(self, num_inputs, num_actions, hidden_dim, batch_norm=False, layer_norm=False, skip_connection=False):
         super(QNetwork, self).__init__()
-
+        self.skip_connection = skip_connection
         # Q1 architecture
-        self.linear1 = nn.Linear(num_inputs + num_actions, hidden_dim)
-        self.linear2 = nn.Linear(hidden_dim, hidden_dim)
-        self.linear3 = nn.Linear(hidden_dim, 1)
+        if skip_connection:
+            self.linear1 = nn.Linear(num_inputs + num_actions, hidden_dim)
+            self.linear2 = nn.Linear(hidden_dim, hidden_dim)
+            self.linear3 = nn.Linear(hidden_dim, hidden_dim)
+            self.linear4 = nn.Linear(hidden_dim, hidden_dim)
+            self.linear5 = nn.Linear(hidden_dim, 1)
 
-        # Q2 architecture
-        self.linear4 = nn.Linear(num_inputs + num_actions, hidden_dim)
-        self.linear5 = nn.Linear(hidden_dim, hidden_dim)
-        self.linear6 = nn.Linear(hidden_dim, 1)
+            # Q2 architecture
+            self.linear6 = nn.Linear(num_inputs + num_actions, hidden_dim)
+            self.linear7 = nn.Linear(hidden_dim, hidden_dim)
+            self.linear8 = nn.Linear(hidden_dim, hidden_dim)
+            self.linear9 = nn.Linear(hidden_dim, hidden_dim)
+            self.linear10 = nn.Linear(hidden_dim, 1)
+        else:
+            self.linear1 = nn.Linear(num_inputs + num_actions, hidden_dim)
+            self.linear2 = nn.Linear(hidden_dim, hidden_dim)
+            self.linear3 = nn.Linear(hidden_dim, 1)
+
+            # Q2 architecture
+            self.linear4 = nn.Linear(num_inputs + num_actions, hidden_dim)
+            self.linear5 = nn.Linear(hidden_dim, hidden_dim)
+            self.linear6 = nn.Linear(hidden_dim, 1)
+
         if batch_norm:
             self.bn1 = nn.BatchNorm1d(hidden_dim) # BatchRenorm1d(hidden_dim)
             self.bn2 = nn.BatchNorm1d(hidden_dim) # BatchRenorm1d(hidden_dim)
             self.bn3 = nn.BatchNorm1d(hidden_dim) # BatchRenorm1d(hidden_dim)
             self.bn4 = nn.BatchNorm1d(hidden_dim) # BatchRenorm1d(hidden_dim)
+        elif layer_norm:
+            self.bn1 = nn.LayerNorm(hidden_dim)
+            self.bn2 = nn.LayerNorm(hidden_dim)
+            self.bn3 = nn.LayerNorm(hidden_dim)
+            self.bn4 = nn.LayerNorm(hidden_dim)
         else:
             self.bn1 = nn.Identity()
             self.bn2 = nn.Identity()
@@ -60,14 +80,28 @@ class QNetwork(nn.Module):
 
     def forward(self, state, action):
         xu = torch.cat([state, action], 1)
-        
-        x1 = F.relu(self.bn1(self.linear1(xu)))
-        x1 = F.relu(self.bn2(self.linear2(x1)))
-        x1 = self.linear3(x1)
 
-        x2 = F.relu(self.bn3(self.linear4(xu)))
-        x2 = F.relu(self.bn4(self.linear5(x2)))
-        x2 = self.linear6(x2)
+        if self.skip_connection:
+            x1_1 = F.relu(self.linear1(xu))
+            x1_2 = F.relu(x1_1 + self.linear2(self.bn1(x1_1)))
+            x1_3 = F.relu(self.linear3(x1_2))
+            x1_4 = F.relu(x1_3 + self.linear4(self.bn2(x1_3)))
+            x1 = self.linear5(x1_4)
+
+            x2_1 = F.relu(self.linear6(xu))
+            x2_2 = F.relu(x2_1 + self.linear7(self.bn3(x2_1)))
+            x2_3 = F.relu(self.linear8(x2_2))
+            x2_4 = F.relu(x2_3 + self.linear9(self.bn4(x2_3)))
+            x2 = self.linear10(x2_4)
+
+        else:
+            x1 = F.relu(self.bn1(self.linear1(xu)))
+            x1 = F.relu(self.bn2(self.linear2(x1)))
+            x1 = self.linear3(x1)
+
+            x2 = F.relu(self.bn3(self.linear4(xu)))
+            x2 = F.relu(self.bn4(self.linear5(x2)))
+            x2 = self.linear6(x2)
 
         return x1, x2
 

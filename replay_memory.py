@@ -15,13 +15,11 @@ class ReplayMemory:
         self.position = (self.position + 1) % self.capacity
 
     def sample(self, batch_size):
-        batch = random.sample(self.buffer, batch_size)
+        if len(self.buffer) < batch_size:
+            batch = random.choices(self.buffer, k=batch_size)
+        else:
+            batch = random.sample(self.buffer, batch_size)
         batch_zip = [np.array(b) for b in zip(*batch)]
-        # for i in range(len(batch_zip)):
-        #     if i == 1:
-        #         continue
-        #     for j in range(len(batch)):
-        #         batch_zip[i][j] = self.clean_array(batch_zip[i][j])
         state, action, reward, next_state, done = map(np.stack, batch_zip)
         return state, action, reward, next_state, done
 
