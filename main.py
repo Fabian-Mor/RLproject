@@ -136,22 +136,22 @@ def main():
     eps = opts.eps
     lr = opts.lr
     random_seed = opts.seed
-    train = False
+    train = True
+    model_name = "droQ"
     side_a = True
     warmup = True
     basic_episodes = 500
     self_play_episodes = 5000
     episodes_per_agent = 100
-    add_to_self_play_episodes = 500
+    add_to_self_play_episodes = 250
 
-
+    reload(h_env)
+    basic_env = h_env.HockeyEnv()
+    action_space = h_env.HockeyEnv_BasicOpponent().action_space
     np.set_printoptions(suppress=True)
-    # TODO: maybe include random agent to train shooting and defense in the beginning
 
     if train:
-        reload(h_env)
-        basic_env = h_env.HockeyEnv()
-        agent = SAC(basic_env.observation_space.shape[0], basic_env.action_space, args)
+        agent = SAC(basic_env.observation_space.shape[0], action_space, args)
         player2 = h_env.BasicOpponent(weak=True)
 
         if warmup:
@@ -171,9 +171,9 @@ def main():
         training(env, basic_episodes, max_timesteps, agent, player2, train_iter, side_a=side_a)
 
         # self training
-        agent.state("hockey", ckpt_path="checkpoints/self_train_checkpoints/droQ_0")
-        agent_self_play = SAC(basic_env.observation_space.shape[0], basic_env.action_space, args)
-        agent_self_play.restore_state("checkpoints/self_train_checkpoints/droQ_0", evaluate=True)
+        agent.state("hockey", ckpt_path=f"checkpoints/self_train_checkpoints/{model_name}_0")
+        agent_self_play = SAC(basic_env.observation_space.shape[0], action_space, args)
+        agent_self_play.restore_state(f"checkpoints/self_train_checkpoints/{model_name}_0", evaluate=True)
         opponents = [h_env.BasicOpponent(weak=True), h_env.BasicOpponent(weak=False), agent_self_play]
         agent.reset()
         acc = add_to_self_play_episodes
@@ -182,13 +182,13 @@ def main():
             opp = random.choice(opponents)
             training(env, episodes_per_agent, max_timesteps, agent, opp, train_iter, side_a=side_a)
             if i >= acc:
-                agent.state("hockey", ckpt_path=f"checkpoints/self_train_checkpoints/droQ_{i}")
-                agent_self_play = SAC(basic_env.observation_space.shape[0], basic_env.action_space, args)
-                agent_self_play.restore_state(f"checkpoints/self_train_checkpoints/droQ_{i}", evaluate=True)
+                agent.state("hockey", ckpt_path=f"checkpoints/self_train_checkpoints/{model_name}_{i}")
+                agent_self_play = SAC(basic_env.observation_space.shape[0], action_space, args)
+                agent_self_play.restore_state(f"checkpoints/self_train_checkpoints/{model_name}_{i}", evaluate=True)
                 opponents.append(agent_self_play)
                 acc += add_to_self_play_episodes
 
-        agent.state("hockey", suffix="droQ")
+        agent.state("hockey", suffix=f"{model_name}")
         show_progress(env, max_timesteps, agent, 10, opponent=player2)
 
     else:
@@ -206,35 +206,19 @@ def main():
         args2.skip_connection = False
         args2.droQ = True
 
-        reload(h_env)
-        basic_env = h_env.HockeyEnv()
         player2 = h_env.BasicOpponent(weak=False)
-        agent1 = SAC(basic_env.observation_space.shape[0], basic_env.action_space, args1)
-        agent1.restore_state("checkpoints/sac_checkpoint_hockey_droQ_both_sides", True)
-        agent1.set_eval_mode()
-        agent2 = SAC(basic_env.observation_space.shape[0], basic_env.action_space, args2)
-        agent2.restore_state("checkpoints/sac_checkpoint_hockey_droQ", True)
-        agent2.set_eval_mode()
 
+        agent1 = SAC(basic_env.observation_space.shape[0], action_space, args1)
+        agent1.restore_state("checkpoints/sac_checkpoint_hockey_droQ_weak", True)
 
         print("Agent vs Agent")
-        show_progress(basic_env, max_timesteps, agent2, 100, opponent=agent2)
+        show_progress(basic_env, max_timesteps, agent1, 100, opponent=agent1)
 
-        print("Basic vs Basic")
-        show_progress(basic_env, max_timesteps, player2, 100, opponent=player2)
-
-        print("Agent 1 vs BasicOpponent")
+        print("Agent vs Basic")
         show_progress(basic_env, max_timesteps, agent1, 100, opponent=player2)
-        print("BasicOpponent vs Agent 1")
+
+        print("Basic vs Agent")
         show_progress(basic_env, max_timesteps, player2, 100, opponent=agent1)
-        print("Agent 2 vs BasicOpponent")
-        show_progress(basic_env, max_timesteps, agent2, 100, opponent=player2)
-        print("BasicOpponent vs Agent 2")
-        show_progress(basic_env, max_timesteps, player2, 100, opponent=agent2)
-        print("Agent 1 vs Agent 2")
-        show_progress(basic_env, max_timesteps, agent1, 100, opponent=agent2)
-        print("Agent 2 vs Agent 1")
-        show_progress(basic_env, max_timesteps, agent2, 100, opponent=agent1)
 
 
 if __name__ == '__main__':
