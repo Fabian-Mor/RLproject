@@ -17,7 +17,7 @@ torch.set_num_threads(1)
 
 # TODO: create szenario to train agent to not only go for balls in a straight line
 
-def training(env, max_episodes, max_timesteps, agent, player2, train_iter):
+def training(env, max_episodes, max_timesteps, agent, player2, train_iter, side_a=None):
     rewards = []
     losses = []
     timestep = 0
@@ -25,7 +25,8 @@ def training(env, max_episodes, max_timesteps, agent, player2, train_iter):
         ob1, _info = env.reset()
         ob2 = env.obs_agent_two()
         total_reward = 0
-        side_a = random.choice([True, False])
+        if side_a is None:
+            side_a = random.choice([True, False])
         # print("side_a", side_a)
         for t in range(max_timesteps):
             timestep += 1
@@ -42,6 +43,7 @@ def training(env, max_episodes, max_timesteps, agent, player2, train_iter):
                 # print(ob1, a1, reward, ob1_new, done)
                 agent.store_transition((ob1, a1, reward, ob1_new, done))
             else:
+                # print(reward, env.get_reward_agent_two(env.get_info_agent_two()))
                 reward = env.get_reward_agent_two(env.get_info_agent_two())
                 # print(ob2, a2, reward, ob2_new, done)
                 agent.store_transition((ob2, a2, reward, ob2_new, done))
@@ -58,11 +60,12 @@ def training(env, max_episodes, max_timesteps, agent, player2, train_iter):
 
 
 def show_progress(env, max_timesteps, agent, show_runs, opponent=None):
+    winner = []
     for _ in range(show_runs):
         ob1, info = env.reset()
         ob2 = env.obs_agent_two()
         for _ in range(max_timesteps):
-            env.render()
+            # env.render()
             a1 = agent.act(ob1)
             if opponent is not None:
                 a2 = opponent.act(ob2)
@@ -72,7 +75,11 @@ def show_progress(env, max_timesteps, agent, show_runs, opponent=None):
             ob1 = obs
             ob2 = env.obs_agent_two()
             if d or t: break
-        print(info)
+        winner.append(info["winner"])
+    winner = np.array(winner)
+    print(np.mean(winner))
+    print("score", np.count_nonzero(winner == 1), np.count_nonzero(winner == -1))
+    print("draws: ", np.count_nonzero(winner == 0))
     env.close()
 
 
@@ -120,6 +127,7 @@ def main():
         batch_norm=False,
         layer_norm=False,
         skip_connection=False,
+        droQ=True
     )
     max_episodes = opts.max_episodes
     max_timesteps = 100000
@@ -127,7 +135,8 @@ def main():
     eps = opts.eps
     lr = opts.lr
     random_seed = opts.seed
-    train = True
+    train = False
+    side_a = None
 
     np.set_printoptions(suppress=True)
     # TODO: maybe include random agent to train shooting and defense in the beginning
@@ -136,27 +145,28 @@ def main():
         reload(h_env)
         basic_env = h_env.HockeyEnv()
         agent = SAC(basic_env.observation_space.shape[0], basic_env.action_space, args)
-        player2 = h_env.BasicOpponent(weak=False)
+        player2 = h_env.BasicOpponent(weak=True)
 
         # train shooting
-        env = h_env.HockeyEnv(mode=h_env.Mode.TRAIN_DEFENSE)
-        training(env, max_episodes, max_timesteps, agent, player2, train_iter)
+        env = h_env.HockeyEnv(mode=h_env.Mode.TRAIN_SHOOTING)
+        training(env, int(max_episodes / 10), max_timesteps, agent, player2, train_iter, side_a=side_a)
         show_progress(env, max_timesteps, agent, 10)
 
         # train defense
-        env = h_env.HockeyEnv(mode=h_env.Mode.TRAIN_SHOOTING)
-        training(env, max_episodes, max_timesteps, agent, player2, train_iter)
+        env = h_env.HockeyEnv(mode=h_env.Mode.TRAIN_DEFENSE)
+        training(env, int(max_episodes / 10), max_timesteps, agent, player2, train_iter, side_a=side_a)
         show_progress(env, max_timesteps, agent, 10)
 
         # train against weak
         env = h_env.HockeyEnv()
-        training(env, max_episodes, max_timesteps, agent, player2, train_iter)
+        training(env, max_episodes, max_timesteps, agent, player2, train_iter, side_a=side_a)
+        show_progress(env, max_timesteps, agent, 10, opponent=player2)
 
         # train against strong
         player2 = h_env.BasicOpponent(weak=False)
-        training(env, max_episodes, max_timesteps, agent, player2, train_iter)
+        training(env, max_episodes, max_timesteps, agent, player2, train_iter, side_a=side_a)
 
-        agent.state("hockey", suffix="target")
+        agent.state("hockey", suffix="droQ_both_sides")
         show_progress(env, max_timesteps, agent, 10, opponent=player2)
 
     else:
@@ -165,21 +175,44 @@ def main():
         args1.batch_norm = False
         args1.layer_norm = False
         args1.skip_connection = False
+        args1.droQ = False
 
         args2 = copy.deepcopy(args)
-        args2.use_target = False
+        args2.use_target = True
         args2.batch_norm = False
-        args2.layer_norm = True
-        args2.skip_connection = True
+        args2.layer_norm = False
+        args2.skip_connection = False
+        args2.droQ = True
 
         reload(h_env)
         basic_env = h_env.HockeyEnv()
         player2 = h_env.BasicOpponent(weak=False)
         agent1 = SAC(basic_env.observation_space.shape[0], basic_env.action_space, args1)
         agent1.restore_state("checkpoints/sac_checkpoint_hockey_target", True)
+        agent1.set_eval_mode()
         agent2 = SAC(basic_env.observation_space.shape[0], basic_env.action_space, args2)
-        agent2.restore_state("checkpoints/sac_checkpoint_hockey_layer_skip", True)
-        show_progress(basic_env, max_timesteps, agent2, 10, opponent=agent1)
+        agent2.restore_state("checkpoints/sac_checkpoint_hockey_droQ", True)
+        agent2.set_eval_mode()
+
+
+        print("Agent vs Agent")
+        show_progress(basic_env, max_timesteps, agent2, 100, opponent=agent2)
+
+        print("Basic vs Basic")
+        show_progress(basic_env, max_timesteps, player2, 100, opponent=player2)
+
+        print("Agent 1 vs BasicOpponent")
+        show_progress(basic_env, max_timesteps, agent1, 100, opponent=player2)
+        print("BasicOpponent vs Agent 1")
+        show_progress(basic_env, max_timesteps, player2, 100, opponent=agent1)
+        print("Agent 2 vs BasicOpponent")
+        show_progress(basic_env, max_timesteps, agent2, 100, opponent=player2)
+        print("BasicOpponent vs Agent 2")
+        show_progress(basic_env, max_timesteps, player2, 100, opponent=agent2)
+        print("Agent 1 vs Agent 2")
+        show_progress(basic_env, max_timesteps, agent1, 100, opponent=agent2)
+        print("Agent 2 vs Agent 1")
+        show_progress(basic_env, max_timesteps, agent2, 100, opponent=agent1)
 
 
 if __name__ == '__main__':

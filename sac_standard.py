@@ -21,13 +21,15 @@ class SAC(object):
         self.batch_norm = args.batch_norm
         self.layer_norm = args.layer_norm
         self.skip_connection = args.skip_connection
+        self.droQ = args.droQ
+        self.evaluate=False
         self.critic = QNetwork(num_inputs, action_space.shape[0], args.hidden_size, batch_norm=args.batch_norm,
-                               layer_norm=args.layer_norm, skip_connection=args.skip_connection).to(device=self.device)
+                               layer_norm=args.layer_norm, skip_connection=args.skip_connection, droQ=args.droQ).to(device=self.device)
         self.critic_optim = Adam(self.critic.parameters(), lr=args.lr)
         self.use_target = args.use_target
         if args.use_target:
             self.critic_target = QNetwork(num_inputs, action_space.shape[0], args.hidden_size, batch_norm=args.batch_norm,
-                                          layer_norm=args.layer_norm, skip_connection=args.skip_connection).to(self.device)
+                                          layer_norm=args.layer_norm, skip_connection=args.skip_connection, droQ=args.droQ).to(self.device)
             hard_update(self.critic_target, self.critic)
         self.memory = ReplayMemory(args.replay_size, 1)
         self.batch_size = args.batch_size
@@ -48,13 +50,19 @@ class SAC(object):
             self.policy = DeterministicPolicy(num_inputs, action_space.shape[0], args.hidden_size, action_space).to(self.device)
             self.policy_optim = Adam(self.policy.parameters(), lr=args.lr)
 
-    def act(self, state, evaluate=False):
+    def act(self, state):
         state = torch.FloatTensor(state).to(self.device).unsqueeze(0)
-        if evaluate is False:
+        if self.evaluate is False:
             action, _, _ = self.policy.sample(state)
         else:
             _, _, action = self.policy.sample(state)
         return action.detach().cpu().numpy()[0]
+
+    def set_eval_mode(self):
+        self.evaluate=True
+
+    def set_training_mode(self):
+        self.evaluate=False
 
     def train(self, updates, iter_fit=32):
         losses = []
@@ -70,7 +78,7 @@ class SAC(object):
 
             with torch.no_grad():
                 next_state_action, next_state_log_pi, _ = self.policy.sample(next_state_batch)
-                if self.batch_norm or self.layer_norm:
+                if self.batch_norm:
                     # use the trick of the paper crossq
                     combined_obs = torch.cat([state_batch, next_state_batch], dim=0)
                     combined_actions = torch.cat([action_batch, next_state_action], dim=0)

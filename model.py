@@ -33,53 +33,92 @@ class ValueNetwork(nn.Module):
 
 
 class QNetwork(nn.Module):
-    def __init__(self, num_inputs, num_actions, hidden_dim, batch_norm=False, layer_norm=False, skip_connection=False):
+    def __init__(self, num_inputs, num_actions, hidden_dim, batch_norm=False, layer_norm=False, skip_connection=False, droQ=False):
         super(QNetwork, self).__init__()
         self.skip_connection = skip_connection
-        # Q1 architecture
-        if skip_connection:
-            self.linear1 = nn.Linear(num_inputs + num_actions, hidden_dim)
-            self.linear2 = nn.Linear(hidden_dim, hidden_dim)
-            self.linear3 = nn.Linear(hidden_dim, hidden_dim)
-            self.linear4 = nn.Linear(hidden_dim, hidden_dim)
-            self.linear5 = nn.Linear(hidden_dim, 1)
+        self.droQ = droQ
+        if droQ:
+            self.dropout = nn.Dropout(p=0.01)
 
-            # Q2 architecture
-            self.linear6 = nn.Linear(num_inputs + num_actions, hidden_dim)
-            self.linear7 = nn.Linear(hidden_dim, hidden_dim)
-            self.linear8 = nn.Linear(hidden_dim, hidden_dim)
-            self.linear9 = nn.Linear(hidden_dim, hidden_dim)
-            self.linear10 = nn.Linear(hidden_dim, 1)
-        else:
             self.linear1 = nn.Linear(num_inputs + num_actions, hidden_dim)
+            self.layer_norm1 = nn.LayerNorm(hidden_dim)
             self.linear2 = nn.Linear(hidden_dim, hidden_dim)
+            self.layer_norm2 = nn.LayerNorm(hidden_dim)
             self.linear3 = nn.Linear(hidden_dim, 1)
 
-            # Q2 architecture
             self.linear4 = nn.Linear(num_inputs + num_actions, hidden_dim)
+            self.layer_norm3 = nn.LayerNorm(hidden_dim)
             self.linear5 = nn.Linear(hidden_dim, hidden_dim)
+            self.layer_norm4 = nn.LayerNorm(hidden_dim)
             self.linear6 = nn.Linear(hidden_dim, 1)
 
-        if batch_norm:
-            self.bn1 = nn.BatchNorm1d(hidden_dim) # BatchRenorm1d(hidden_dim)
-            self.bn2 = nn.BatchNorm1d(hidden_dim) # BatchRenorm1d(hidden_dim)
-            self.bn3 = nn.BatchNorm1d(hidden_dim) # BatchRenorm1d(hidden_dim)
-            self.bn4 = nn.BatchNorm1d(hidden_dim) # BatchRenorm1d(hidden_dim)
-        elif layer_norm:
-            self.bn1 = nn.LayerNorm(hidden_dim)
-            self.bn2 = nn.LayerNorm(hidden_dim)
-            self.bn3 = nn.LayerNorm(hidden_dim)
-            self.bn4 = nn.LayerNorm(hidden_dim)
         else:
-            self.bn1 = nn.Identity()
-            self.bn2 = nn.Identity()
-            self.bn3 = nn.Identity()
-            self.bn4 = nn.Identity()
+            if skip_connection:
+                self.linear1 = nn.Linear(num_inputs + num_actions, hidden_dim)
+                self.linear2 = nn.Linear(hidden_dim, hidden_dim)
+                self.linear3 = nn.Linear(hidden_dim, hidden_dim)
+                self.linear4 = nn.Linear(hidden_dim, hidden_dim)
+                self.linear5 = nn.Linear(hidden_dim, 1)
+
+                # Q2 architecture
+                self.linear6 = nn.Linear(num_inputs + num_actions, hidden_dim)
+                self.linear7 = nn.Linear(hidden_dim, hidden_dim)
+                self.linear8 = nn.Linear(hidden_dim, hidden_dim)
+                self.linear9 = nn.Linear(hidden_dim, hidden_dim)
+                self.linear10 = nn.Linear(hidden_dim, 1)
+            else:
+                self.linear1 = nn.Linear(num_inputs + num_actions, hidden_dim)
+                self.linear2 = nn.Linear(hidden_dim, hidden_dim)
+                self.linear3 = nn.Linear(hidden_dim, 1)
+
+                # Q2 architecture
+                self.linear4 = nn.Linear(num_inputs + num_actions, hidden_dim)
+                self.linear5 = nn.Linear(hidden_dim, hidden_dim)
+                self.linear6 = nn.Linear(hidden_dim, 1)
+
+            if batch_norm:
+                self.bn1 = nn.BatchNorm1d(hidden_dim) # BatchRenorm1d(hidden_dim)
+                self.bn2 = nn.BatchNorm1d(hidden_dim) # BatchRenorm1d(hidden_dim)
+                self.bn3 = nn.BatchNorm1d(hidden_dim) # BatchRenorm1d(hidden_dim)
+                self.bn4 = nn.BatchNorm1d(hidden_dim) # BatchRenorm1d(hidden_dim)
+            elif layer_norm:
+                self.bn1 = nn.LayerNorm(hidden_dim)
+                self.bn2 = nn.LayerNorm(hidden_dim)
+                self.bn3 = nn.LayerNorm(hidden_dim)
+                self.bn4 = nn.LayerNorm(hidden_dim)
+            else:
+                self.bn1 = nn.Identity()
+                self.bn2 = nn.Identity()
+                self.bn3 = nn.Identity()
+                self.bn4 = nn.Identity()
 
         self.apply(weights_init_)
 
     def forward(self, state, action):
         xu = torch.cat([state, action], 1)
+
+        if self.droQ:
+            x1 = self.linear1(xu)
+            x1 = self.dropout(x1)
+            x1 = self.layer_norm1(x1)
+            x1 = F.relu(x1)
+            x1 = self.linear2(x1)
+            x1 = self.dropout(x1)
+            x1 = self.layer_norm2(x1)
+            x1 = F.relu(x1)
+            x1 = self.linear3(x1)
+
+            x2 = self.linear4(xu)
+            x2 = self.dropout(x2)
+            x2 = self.layer_norm3(x2)
+            x2 = F.relu(x2)
+            x2 = self.linear5(x2)
+            x2 = self.dropout(x2)
+            x2 = self.layer_norm4(x2)
+            x2 = F.relu(x2)
+            x2 = self.linear6(x2)
+
+            return x1, x2
 
         if self.skip_connection:
             x1_1 = F.relu(self.linear1(xu))
