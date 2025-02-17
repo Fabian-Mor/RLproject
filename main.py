@@ -50,7 +50,8 @@ def training(env, max_episodes, max_timesteps, agent, player2, train_iter, side_
             total_reward += reward
             ob2 = ob2_new
             ob1 = ob1_new
-            if done or trunc: break
+            if done or trunc:
+                break
         losses.extend(agent.train(train_iter))
         rewards.append(total_reward)
 
@@ -95,7 +96,7 @@ def main():
                          dest='eps', default=0.1,
                          help='Policy noise (default %default)')
     optParser.add_option('-t', '--train', action='store', type='int',
-                         dest='train', default=32,
+                         dest='train', default=128,
                          help='Number of training batches per episode (default %default)')
     optParser.add_option('-l', '--lr', action='store', type='float',
                          dest='lr', default=0.0001,
@@ -121,7 +122,7 @@ def main():
         automatic_entropy_tuning=True,
         hidden_size=256,
         target_update_interval=1,
-        replay_size=100000000,
+        replay_size=100000,
         cuda=False,
         use_target=True,
         batch_norm=False,
@@ -136,7 +137,13 @@ def main():
     lr = opts.lr
     random_seed = opts.seed
     train = False
-    side_a = None
+    side_a = True
+    warmup = True
+    basic_episodes = 500
+    self_play_episodes = 5000
+    episodes_per_agent = 100
+    add_to_self_play_episodes = 500
+
 
     np.set_printoptions(suppress=True)
     # TODO: maybe include random agent to train shooting and defense in the beginning
@@ -147,26 +154,41 @@ def main():
         agent = SAC(basic_env.observation_space.shape[0], basic_env.action_space, args)
         player2 = h_env.BasicOpponent(weak=True)
 
-        # train shooting
-        env = h_env.HockeyEnv(mode=h_env.Mode.TRAIN_SHOOTING)
-        training(env, int(max_episodes / 10), max_timesteps, agent, player2, train_iter, side_a=side_a)
-        show_progress(env, max_timesteps, agent, 10)
-
-        # train defense
-        env = h_env.HockeyEnv(mode=h_env.Mode.TRAIN_DEFENSE)
-        training(env, int(max_episodes / 10), max_timesteps, agent, player2, train_iter, side_a=side_a)
-        show_progress(env, max_timesteps, agent, 10)
+        if warmup:
+            # train shooting
+            env = h_env.HockeyEnv(mode=h_env.Mode.TRAIN_SHOOTING)
+            training(env, int(max_episodes / 10), max_timesteps, agent, player2, train_iter, side_a=side_a)
+            # train defense
+            env = h_env.HockeyEnv(mode=h_env.Mode.TRAIN_DEFENSE)
+            training(env, int(max_episodes / 10), max_timesteps, agent, player2, train_iter, side_a=side_a)
 
         # train against weak
         env = h_env.HockeyEnv()
-        training(env, max_episodes, max_timesteps, agent, player2, train_iter, side_a=side_a)
-        show_progress(env, max_timesteps, agent, 10, opponent=player2)
+        training(env, basic_episodes, max_timesteps, agent, player2, train_iter, side_a=side_a)
 
         # train against strong
         player2 = h_env.BasicOpponent(weak=False)
-        training(env, max_episodes, max_timesteps, agent, player2, train_iter, side_a=side_a)
+        training(env, basic_episodes, max_timesteps, agent, player2, train_iter, side_a=side_a)
 
-        agent.state("hockey", suffix="droQ_both_sides")
+        # self training
+        agent.state("hockey", ckpt_path="checkpoints/self_train_checkpoints/droQ_0")
+        agent_self_play = SAC(basic_env.observation_space.shape[0], basic_env.action_space, args)
+        agent_self_play.restore_state("checkpoints/self_train_checkpoints/droQ_0", evaluate=True)
+        opponents = [h_env.BasicOpponent(weak=True), h_env.BasicOpponent(weak=False), agent_self_play]
+        agent.reset()
+        acc = add_to_self_play_episodes
+        for i in range(0, self_play_episodes, episodes_per_agent):
+            # TODO: make smarter choice here
+            opp = random.choice(opponents)
+            training(env, episodes_per_agent, max_timesteps, agent, opp, train_iter, side_a=side_a)
+            if i >= acc:
+                agent.state("hockey", ckpt_path=f"checkpoints/self_train_checkpoints/droQ_{i}")
+                agent_self_play = SAC(basic_env.observation_space.shape[0], basic_env.action_space, args)
+                agent_self_play.restore_state(f"checkpoints/self_train_checkpoints/droQ_{i}", evaluate=True)
+                opponents.append(agent_self_play)
+                acc += add_to_self_play_episodes
+
+        agent.state("hockey", suffix="droQ")
         show_progress(env, max_timesteps, agent, 10, opponent=player2)
 
     else:
@@ -175,7 +197,7 @@ def main():
         args1.batch_norm = False
         args1.layer_norm = False
         args1.skip_connection = False
-        args1.droQ = False
+        args1.droQ = True
 
         args2 = copy.deepcopy(args)
         args2.use_target = True
@@ -188,7 +210,7 @@ def main():
         basic_env = h_env.HockeyEnv()
         player2 = h_env.BasicOpponent(weak=False)
         agent1 = SAC(basic_env.observation_space.shape[0], basic_env.action_space, args1)
-        agent1.restore_state("checkpoints/sac_checkpoint_hockey_target", True)
+        agent1.restore_state("checkpoints/sac_checkpoint_hockey_droQ_both_sides", True)
         agent1.set_eval_mode()
         agent2 = SAC(basic_env.observation_space.shape[0], basic_env.action_space, args2)
         agent2.restore_state("checkpoints/sac_checkpoint_hockey_droQ", True)

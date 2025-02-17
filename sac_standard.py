@@ -60,9 +60,16 @@ class SAC(object):
 
     def set_eval_mode(self):
         self.evaluate=True
+        self.policy.eval()
+        self.critic.eval()
+        if self.use_target:
+            self.critic_target.eval()
 
     def set_training_mode(self):
         self.evaluate=False
+        self.policy.train()
+        self.critic.train()
+        self.critic_target.train()
 
     def train(self, updates, iter_fit=32):
         losses = []
@@ -163,6 +170,7 @@ class SAC(object):
             self.policy_optim.load_state_dict(checkpoint['policy_optimizer_state_dict'])
 
             if evaluate:
+                self.evaluate = True
                 self.policy.eval()
                 self.critic.eval()
                 if self.use_target:
@@ -173,8 +181,7 @@ class SAC(object):
                 self.critic_target.train()
 
     def reset(self):
-        pass
-        # self.memory.reset()
+        self.memory.reset()
 
     def store_transition(self, transition):
         self.memory.push(transition)

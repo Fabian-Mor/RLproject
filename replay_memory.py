@@ -1,5 +1,7 @@
 import random
 import numpy as np
+import os
+import pickle
 
 class ReplayMemory:
     def __init__(self, capacity, seed):
@@ -25,6 +27,7 @@ class ReplayMemory:
 
     def reset(self):
         self.buffer = []
+        self.position = 0
 
     def __len__(self):
         return len(self.buffer)
