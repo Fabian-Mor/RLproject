@@ -52,7 +52,7 @@ def training(env, max_episodes, max_timesteps, agent, player2, train_iter, warmu
                 return
 
 
-def show_progress(env, max_timesteps, agent, show_runs, opponent=None):
+def show_progress(env, max_timesteps, agent, show_runs, opponent=None, verbose=True):
     winner = []
     for _ in range(show_runs):
         ob1, info = env.reset()
@@ -70,10 +70,12 @@ def show_progress(env, max_timesteps, agent, show_runs, opponent=None):
             if d or t: break
         winner.append(info["winner"])
     winner = np.array(winner)
-    print(np.mean(winner))
-    print("score", np.count_nonzero(winner == 1), np.count_nonzero(winner == -1))
-    print("draws: ", np.count_nonzero(winner == 0))
+    if verbose:
+        print(np.mean(winner))
+        print("score", np.count_nonzero(winner == 1), np.count_nonzero(winner == -1))
+        print("draws: ", np.count_nonzero(winner == 0))
     env.close()
+    return np.mean(winner)
 
 
 def weighted_random_choice(lst):
