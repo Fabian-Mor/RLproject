@@ -5,6 +5,7 @@ from torch.optim import Adam
 from utils import soft_update, hard_update
 from model import GaussianPolicy, QNetwork, DeterministicPolicy
 from replay_memory import ReplayMemory
+import numpy as np
 
 class SAC(object):
     def __init__(self, num_inputs, action_space, args):

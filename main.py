@@ -9,15 +9,16 @@ import optparse
 from types import SimpleNamespace
 import torch
 from sac_standard import SAC
+from random_agent import RandomAgent
 
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 torch.set_num_threads(1)
 
 
-# TODO: create szenario to train agent to not only go for balls in a straight line
 
-def training(env, max_episodes, max_timesteps, agent, player2, train_iter, side_a=None):
+def training(env, max_episodes, max_timesteps, agent, player2, train_iter, warmup=False, draw_score=0):
+    #TODO: punish draws
     rewards = []
     losses = []
     timestep = 0
@@ -25,28 +26,16 @@ def training(env, max_episodes, max_timesteps, agent, player2, train_iter, side_
         ob1, _info = env.reset()
         ob2 = env.obs_agent_two()
         total_reward = 0
-        if side_a is None:
-            side_a = random.choice([True, False])
-        # print("side_a", side_a)
         for t in range(max_timesteps):
             timestep += 1
-            if side_a:
-                a1 = agent.act(ob1)
-                a2 = player2.act(ob2)
-            else:
-                a1 = player2.act(ob1)
-                a2 = agent.act(ob2)
+            a1 = agent.act(ob1)
+            a2 = player2.act(ob2)
 
             (ob1_new, reward, done, trunc, _info) = env.step(np.hstack([a1, a2]))
             ob2_new = env.obs_agent_two()
-            if side_a:
-                # print(ob1, a1, reward, ob1_new, done)
-                agent.store_transition((ob1, a1, reward, ob1_new, done))
-            else:
-                # print(reward, env.get_reward_agent_two(env.get_info_agent_two()))
-                reward = env.get_reward_agent_two(env.get_info_agent_two())
-                # print(ob2, a2, reward, ob2_new, done)
-                agent.store_transition((ob2, a2, reward, ob2_new, done))
+            reward *= 10
+            reward += _info["reward_closeness_to_puck"] + _info["reward_touch_puck"] + _info["reward_puck_direction"]
+            agent.store_transition((ob1, a1, reward, ob1_new, done))
             total_reward += reward
             ob2 = ob2_new
             ob1 = ob1_new
@@ -58,6 +47,9 @@ def training(env, max_episodes, max_timesteps, agent, player2, train_iter, side_
         if i_episode % 20 == 0:
             avg_reward = np.mean(rewards[-20:])
             print('Episode {} \t reward: {}'.format(i_episode, avg_reward))
+            if warmup and avg_reward > 0:
+                print('ending warmup after {} episodes'.format(i_episode))
+                return
 
 
 def show_progress(env, max_timesteps, agent, show_runs, opponent=None):
@@ -84,6 +76,12 @@ def show_progress(env, max_timesteps, agent, show_runs, opponent=None):
     env.close()
 
 
+def weighted_random_choice(lst):
+    weights = np.arange(1, len(lst) + 1)
+    index = np.random.choice(len(lst), p=weights / weights.sum())
+    return lst[index]
+
+
 def main():
     optParser = optparse.OptionParser()
     optParser.add_option('-e', '--env', action='store', type='string',
@@ -96,7 +94,7 @@ def main():
                          dest='eps', default=0.1,
                          help='Policy noise (default %default)')
     optParser.add_option('-t', '--train', action='store', type='int',
-                         dest='train', default=128,
+                         dest='train', default=50,
                          help='Number of training batches per episode (default %default)')
     optParser.add_option('-l', '--lr', action='store', type='float',
                          dest='lr', default=0.0001,
@@ -113,22 +111,22 @@ def main():
     opts, args = optParser.parse_args()
 
     args = SimpleNamespace(
-        lr=0.0003,
+        lr=0.0001,
         policy="Gaussian",
         gamma=0.99,
         tau=0.005,
         alpha=0.2,
-        batch_size=128,
+        batch_size=1024,
         automatic_entropy_tuning=True,
         hidden_size=256,
         target_update_interval=1,
-        replay_size=100000,
+        replay_size=1000000,
         cuda=False,
         use_target=True,
         batch_norm=False,
-        layer_norm=False,
-        skip_connection=False,
-        droQ=True
+        layer_norm=True,
+        skip_connection=True,
+        droQ=False
     )
     max_episodes = opts.max_episodes
     max_timesteps = 100000
@@ -136,60 +134,101 @@ def main():
     eps = opts.eps
     lr = opts.lr
     random_seed = opts.seed
+
+    stability_test = False
+    stability_runs = 10
+
     train = True
-    model_name = "droQ"
-    side_a = True
+    model_name = "crossq_new_reward"
+    load_model = ""
     warmup = True
-    basic_episodes = 500
-    self_play_episodes = 5000
-    episodes_per_agent = 100
-    add_to_self_play_episodes = 250
+    warmup_max_episodes = 1000
+    self_play = True
+    warmup_episodes = 1000 # 500 # standard 1000
+    basic_episodes = 10000 # 500 # standard 10000
+    self_play_episodes = 10000
+    episodes_per_agent = 500
+    add_to_self_play_episodes = 2000
 
     reload(h_env)
     basic_env = h_env.HockeyEnv()
     action_space = h_env.HockeyEnv_BasicOpponent().action_space
     np.set_printoptions(suppress=True)
 
+
+    if stability_test:
+        for i in range(stability_runs):
+            agent = SAC(basic_env.observation_space.shape[0], action_space, args)
+            player2 = h_env.BasicOpponent(weak=True)
+            if warmup:
+                # train shooting
+                env = h_env.HockeyEnv(mode=h_env.Mode.TRAIN_SHOOTING)
+                training(env, warmup_max_episodes, max_timesteps, agent, player2, train_iter, warmup=True)
+                # train defense
+                env = h_env.HockeyEnv(mode=h_env.Mode.TRAIN_DEFENSE)
+                training(env, warmup_max_episodes, max_timesteps, agent, player2, train_iter, warmup=True)
+
+            # train against weak
+            env = h_env.HockeyEnv()
+            training(env, basic_episodes, max_timesteps, agent, player2, train_iter)
+
+            # train against strong
+            player2 = h_env.BasicOpponent(weak=False)
+            training(env, basic_episodes, max_timesteps, agent, player2, train_iter)
+
+            agent.state("hockey", ckpt_path=f"checkpoints/stability_test/{model_name}/run_{i}")
+
+
     if train:
         agent = SAC(basic_env.observation_space.shape[0], action_space, args)
+        if load_model != "":
+            agent.restore_state(load_model, evaluate=False)
+        random_player = RandomAgent(action_space)
         player2 = h_env.BasicOpponent(weak=True)
 
         if warmup:
             # train shooting
             env = h_env.HockeyEnv(mode=h_env.Mode.TRAIN_SHOOTING)
-            training(env, int(max_episodes / 10), max_timesteps, agent, player2, train_iter, side_a=side_a)
+            training(env, warmup_episodes, max_timesteps, agent, player2, train_iter, warmup=True)
             # train defense
             env = h_env.HockeyEnv(mode=h_env.Mode.TRAIN_DEFENSE)
-            training(env, int(max_episodes / 10), max_timesteps, agent, player2, train_iter, side_a=side_a)
+            training(env, warmup_episodes, max_timesteps, agent, player2, train_iter, warmup=True)
 
-        # train against weak
+
+
+
         env = h_env.HockeyEnv()
-        training(env, basic_episodes, max_timesteps, agent, player2, train_iter, side_a=side_a)
+        opponents = [random_player, h_env.BasicOpponent(weak=True), h_env.BasicOpponent(weak=False)]
+        for i in range(0, basic_episodes, 500):
+            opp = weighted_random_choice(opponents)
+            training(env, 100, max_timesteps, agent, opp, train_iter) # warmup=True
 
         # train against strong
-        player2 = h_env.BasicOpponent(weak=False)
-        training(env, basic_episodes, max_timesteps, agent, player2, train_iter, side_a=side_a)
+        # player2 = h_env.BasicOpponent(weak=False)
+        # training(env, basic_episodes, max_timesteps, agent, player2, train_iter)
 
-        # self training
-        agent.state("hockey", ckpt_path=f"checkpoints/self_train_checkpoints/{model_name}_0")
-        agent_self_play = SAC(basic_env.observation_space.shape[0], action_space, args)
-        agent_self_play.restore_state(f"checkpoints/self_train_checkpoints/{model_name}_0", evaluate=True)
-        opponents = [h_env.BasicOpponent(weak=True), h_env.BasicOpponent(weak=False), agent_self_play]
-        agent.reset()
-        acc = add_to_self_play_episodes
-        for i in range(0, self_play_episodes, episodes_per_agent):
-            # TODO: make smarter choice here
-            opp = random.choice(opponents)
-            training(env, episodes_per_agent, max_timesteps, agent, opp, train_iter, side_a=side_a)
-            if i >= acc:
-                agent.state("hockey", ckpt_path=f"checkpoints/self_train_checkpoints/{model_name}_{i}")
-                agent_self_play = SAC(basic_env.observation_space.shape[0], action_space, args)
-                agent_self_play.restore_state(f"checkpoints/self_train_checkpoints/{model_name}_{i}", evaluate=True)
-                opponents.append(agent_self_play)
-                acc += add_to_self_play_episodes
+        if self_play:
+            print("Starting self-play")
+            # self training
+            agent.state("hockey", ckpt_path=f"checkpoints/self_train_checkpoints/{model_name}_0")
+            agent_self_play = SAC(basic_env.observation_space.shape[0], action_space, args)
+            agent_self_play.restore_state(f"checkpoints/self_train_checkpoints/{model_name}_0", evaluate=True)
+            opponents = [h_env.BasicOpponent(weak=True), h_env.BasicOpponent(weak=False), agent_self_play]
+            agent.reset()
+            acc = add_to_self_play_episodes
+            for i in range(0, self_play_episodes, episodes_per_agent):
+                opp = weighted_random_choice(opponents)
+                training(env, episodes_per_agent, max_timesteps, agent, opp, train_iter)
+                if i >= acc:
+                    agent.state("hockey", ckpt_path=f"checkpoints/self_train_checkpoints/{model_name}_{i}")
+                    agent_self_play = SAC(basic_env.observation_space.shape[0], action_space, args)
+                    agent_self_play.restore_state(f"checkpoints/self_train_checkpoints/{model_name}_{i}", evaluate=True)
+                    opponents.append(agent_self_play)
+                    opponents.append(h_env.BasicOpponent(weak=False))
+                    acc += add_to_self_play_episodes
 
         agent.state("hockey", suffix=f"{model_name}")
-        show_progress(env, max_timesteps, agent, 10, opponent=player2)
+        show_progress(env, max_timesteps, agent, 100, opponent=player2)
 
     else:
         args1 = copy.deepcopy(args)
@@ -197,28 +236,63 @@ def main():
         args1.batch_norm = False
         args1.layer_norm = False
         args1.skip_connection = False
-        args1.droQ = True
+        args1.droQ = False
 
         args2 = copy.deepcopy(args)
-        args2.use_target = True
-        args2.batch_norm = False
+        args2.use_target = False
+        args2.batch_norm = True
         args2.layer_norm = False
         args2.skip_connection = False
-        args2.droQ = True
+        args2.droQ = False
+
+        args3 = copy.deepcopy(args)
+        args3.use_target = True
+        args3.batch_norm = False
+        args3.layer_norm = True
+        args3.skip_connection = True
+        args3.droQ = False
+
+        args4 = copy.deepcopy(args)
+        args4.use_target = True
+        args4.batch_norm = False
+        args4.layer_norm = False
+        args4.skip_connection = False
+        args4.droQ = True
 
         player2 = h_env.BasicOpponent(weak=False)
+        random_player = RandomAgent(action_space)
 
-        agent1 = SAC(basic_env.observation_space.shape[0], action_space, args1)
-        agent1.restore_state("checkpoints/sac_checkpoint_hockey_droQ_weak", True)
 
-        print("Agent vs Agent")
-        show_progress(basic_env, max_timesteps, agent1, 100, opponent=agent1)
+        droq0 = SAC(basic_env.observation_space.shape[0], action_space, args4)
+        droq0.restore_state("checkpoints/sac_checkpoint_hockey_droQ", True)
+        droq1 = SAC(basic_env.observation_space.shape[0], action_space, args4)
+        droq1.restore_state("checkpoints/sac_checkpoint_hockey_droQ_new_reward", True)
 
-        print("Agent vs Basic")
-        show_progress(basic_env, max_timesteps, agent1, 100, opponent=player2)
 
-        print("Basic vs Agent")
-        show_progress(basic_env, max_timesteps, player2, 100, opponent=agent1)
+        show_progress(basic_env, max_timesteps, droq0, 100, opponent=droq1)
+        show_progress(basic_env, max_timesteps, droq0, 100, opponent=player2)
+        show_progress(basic_env, max_timesteps, droq1, 100, opponent=player2)
+
+        basic = SAC(basic_env.observation_space.shape[0], action_space, args1)
+        basic.restore_state("checkpoints/stability_test/basic/run_0", True)
+        crossq = SAC(basic_env.observation_space.shape[0], action_space, args2)
+        crossq.restore_state("checkpoints/stability_test/crossq/run_0", True)
+        deep = SAC(basic_env.observation_space.shape[0], action_space, args3)
+        deep.restore_state("checkpoints/stability_test/deep/run_0", True)
+        droq = SAC(basic_env.observation_space.shape[0], action_space, args4)
+        droq.restore_state("checkpoints/stability_test/droq/run_0", True)
+
+        print("basic vs strong")
+        show_progress(basic_env, max_timesteps, basic, 100, opponent=player2)
+
+        print("crossq vs strong")
+        show_progress(basic_env, max_timesteps, crossq, 100, opponent=player2)
+
+        print("deep vs strong")
+        show_progress(basic_env, max_timesteps, deep, 100, opponent=player2)
+
+        print("droq vs strong")
+        show_progress(basic_env, max_timesteps, droq, 100, opponent=player2)
 
 
 if __name__ == '__main__':
