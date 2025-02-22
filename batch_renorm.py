@@ -5,7 +5,7 @@ class BatchRenorm(torch.jit.ScriptModule):
         self,
         num_features: int,
         eps: float = 1e-3,
-        momentum: float = 0.01,
+        momentum: float = 0.99, # 0.01,
         affine: bool = True,
     ):
         super().__init__()

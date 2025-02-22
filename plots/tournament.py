@@ -100,7 +100,7 @@ def play_match(agent1, agent2, max_timesteps=100000):
 
 
 # Function to run a round-robin tournament
-def run_tournament(agents, threshold=1.0, max_iterations=100):
+def run_tournament(agents, threshold=1.0, max_iterations=1000000):
     """Run a round-robin tournament where every agent plays against every other agent."""
     iteration = 0
     while iteration < max_iterations:
@@ -122,12 +122,11 @@ def run_tournament(agents, threshold=1.0, max_iterations=100):
 
 
 agents = [
-    Agent("weak"), Agent("strong"),
-    Agent("basic", path="../checkpoints/stability_test/basic/run_0", args=args1),
-    Agent("crossq", path="../checkpoints/stability_test/crossq/run_0", args=args2),
-    Agent("deep", path="../checkpoints/stability_test/deep/run_0", args=args3),
-    Agent("droq", path="../checkpoints/stability_test/droq/run_0", args=args4),
-    Agent("droq_weak", path="../checkpoints/self_train_checkpoints/droQ_weak_0", args=args4),
+    Agent("strong"),
+    Agent("basic", path="../checkpoints/sac_checkpoint_hockey_basic_new_reward", args=args1),
+    Agent("crossq", path="../checkpoints/sac_checkpoint_hockey_crossq_new_reward", args=args2),
+    Agent("deep", path="../checkpoints/sac_checkpoint_hockey_deep_new_reward", args=args3),
+    Agent("droq", path="../checkpoints/sac_checkpoint_hockey_droq_new_reward", args=args4),
 ]
 
 # Run tournament

@@ -18,9 +18,7 @@ torch.set_num_threads(1)
 
 
 def training(env, max_episodes, max_timesteps, agent, player2, train_iter, warmup=False, draw_score=0):
-    #TODO: punish draws
     rewards = []
-    losses = []
     timestep = 0
     for i_episode in range(1, max_episodes + 1):
         ob1, _info = env.reset()
@@ -41,7 +39,7 @@ def training(env, max_episodes, max_timesteps, agent, player2, train_iter, warmu
             ob1 = ob1_new
             if done or trunc:
                 break
-        losses.extend(agent.train(train_iter))
+        agent.train(iter_fit=train_iter)
         rewards.append(total_reward)
 
         if i_episode % 20 == 0:
@@ -85,40 +83,13 @@ def weighted_random_choice(lst):
 
 
 def main():
-    optParser = optparse.OptionParser()
-    optParser.add_option('-e', '--env', action='store', type='string',
-                         dest='env_name', default="Pendulum-v1",
-                         help='Environment (default %default)')
-    optParser.add_option('-a', '--agent', action='store', type='string',
-                         dest='agent', default="SAC",
-                         help='Agent type (DDPG or SAC, default %default)')
-    optParser.add_option('-n', '--eps', action='store', type='float',
-                         dest='eps', default=0.1,
-                         help='Policy noise (default %default)')
-    optParser.add_option('-t', '--train', action='store', type='int',
-                         dest='train', default=50,
-                         help='Number of training batches per episode (default %default)')
-    optParser.add_option('-l', '--lr', action='store', type='float',
-                         dest='lr', default=0.0001,
-                         help='Learning rate for actor/policy (default %default)')
-    optParser.add_option('-m', '--maxepisodes', action='store', type='float',
-                         dest='max_episodes', default=1000,
-                         help='Number of episodes (default %default)')
-    optParser.add_option('-u', '--update', action='store', type='float',
-                         dest='update_every', default=100,
-                         help='Number of episodes between target network updates (default %default)')
-    optParser.add_option('-s', '--seed', action='store', type='int',
-                         dest='seed', default=None,
-                         help='Random seed (default %default)')
-    opts, args = optParser.parse_args()
-
     args = SimpleNamespace(
-        lr=0.0001,
+        lr=0.001, # 0.0003
         policy="Gaussian",
         gamma=0.99,
         tau=0.005,
         alpha=0.2,
-        batch_size=1024,
+        batch_size=256, # 512
         automatic_entropy_tuning=True,
         hidden_size=256,
         target_update_interval=1,
@@ -126,22 +97,23 @@ def main():
         cuda=False,
         use_target=True,
         batch_norm=False,
-        layer_norm=True,
-        skip_connection=True,
-        droQ=False
+        layer_norm=False,
+        skip_connection=False,
+        droQ=False,
+        redQ=True,
+        crossq=False,
     )
-    max_episodes = opts.max_episodes
     max_timesteps = 100000
-    train_iter = opts.train
-    eps = opts.eps
-    lr = opts.lr
-    random_seed = opts.seed
+    if args.redQ or args.droQ:
+        train_iter = 20
+    else:
+        train_iter = 1
 
-    stability_test = False
+    stability_test = True
     stability_runs = 10
 
-    train = True
-    model_name = "crossq_new_reward"
+    train = False
+    model_name = "redq"
     load_model = ""
     warmup = True
     warmup_max_episodes = 1000

@@ -14,42 +14,42 @@ args = SimpleNamespace(
         gamma=0.99,
         tau=0.005,
         alpha=0.2,
-        batch_size=1024,
+        batch_size=256,
         automatic_entropy_tuning=True,
         hidden_size=256,
         target_update_interval=1,
         replay_size=1000000,
         cuda=False,
+        batch_norm = False,
+        layer_norm = False,
+        skip_connection = False,
     )
 
 
 args1 = copy.deepcopy(args)
 args1.use_target = True
-args1.batch_norm = False
-args1.layer_norm = False
-args1.skip_connection = False
 args1.droQ = False
+args1.redQ = False
+args1.crossq = False
 
 args2 = copy.deepcopy(args)
 args2.use_target = False
-args2.batch_norm = True
-args2.layer_norm = False
-args2.skip_connection = False
+args2.batch_norm = True#
 args2.droQ = False
+args2.redQ = False
+args2.crossq = True
 
 args3 = copy.deepcopy(args)
 args3.use_target = True
-args3.batch_norm = False
-args3.layer_norm = True
-args3.skip_connection = True
-args3.droQ = False
+args3.droQ = True
+args3.redQ = False
+args3.crossq = False
 
 args4 = copy.deepcopy(args)
 args4.use_target = True
-args4.batch_norm = False
-args4.layer_norm = False
-args4.skip_connection = False
-args4.droQ = True
+args4.droQ = False
+args4.redQ = True
+args4.crossq = False
 
 reload(h_env)
 basic_env = h_env.HockeyEnv()
@@ -58,12 +58,12 @@ np.set_printoptions(suppress=True)
 opponent = h_env.BasicOpponent(weak=False)
 args_list = [args1, args2, args3, args4]
 
-names = ["basic", "crossq", "deep", "droq"]
+names = ["basic", "crossq", "droq", "redq"]
 all_scores = {name: [] for name in names}
 for name, arg in zip(names, args_list):
     path = f"../checkpoints/stability_test/{name}/"
     scores = []
-    for i in range(10):
+    for i in range(7):
         agent = SAC(basic_env.observation_space.shape[0], action_space, arg)
         agent.restore_state(path + f"run_{i}", evaluate=True)
         score = show_progress(basic_env, 100000, agent, 100, opponent=opponent, verbose=False)
