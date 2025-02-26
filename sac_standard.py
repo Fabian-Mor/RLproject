@@ -7,6 +7,8 @@ from model import GaussianPolicy, QNetwork, DeterministicPolicy
 from replay_memory import ReplayMemory
 import numpy as np
 
+# this file is adjusted from https://github.com/pranz24/pytorch-soft-actor-critic
+
 class SAC(object):
     def __init__(self, num_inputs, action_space, args):
 
