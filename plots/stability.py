@@ -58,21 +58,24 @@ np.set_printoptions(suppress=True)
 opponent = h_env.BasicOpponent(weak=False)
 args_list = [args1, args2, args3, args4]
 
-names = ["basic", "crossq", "droq", "redq"]
+names = ["sac", "crossq", "droq", "redq"]
 all_scores = {name: [] for name in names}
 for name, arg in zip(names, args_list):
     path = f"../checkpoints/stability_test/{name}/"
     scores = []
-    for i in range(7):
+    for i in range(10):
         agent = SAC(basic_env.observation_space.shape[0], action_space, arg)
         agent.restore_state(path + f"run_{i}", evaluate=True)
         score = show_progress(basic_env, 100000, agent, 100, opponent=opponent, verbose=False)
         scores.append(score)
     all_scores[name] = scores
-plt.figure(figsize=(8, 5))
+
+plt.rcParams.update({'font.size': 20})  # Increase global font size
+
+plt.figure(figsize=(12, 7), dpi=300)
 
 # Box plot
-plt.boxplot(all_scores.values(), labels=names, showmeans=True)
+plt.boxplot(all_scores.values(), labels=names, showmeans=False)
 
 # Scatter individual scores
 for i, name in enumerate(names):
@@ -83,7 +86,7 @@ for i, name in enumerate(names):
 plt.xlabel("Agent Type")
 plt.ylabel("Expected Score")
 plt.ylim(-1, 1)
-plt.title("Expected Scores for Different Agents")
+plt.title("Expected Scores against the strong opponent")
 plt.legend()
 plt.grid(True, linestyle="--", alpha=0.6)
 plt.show()
